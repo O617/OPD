@@ -444,6 +444,7 @@ def process_validation_metrics(
                     continue
 
                 metric = {}
+                if var_vals[0] is None: continue
                 n_resps = len(var_vals)
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
 

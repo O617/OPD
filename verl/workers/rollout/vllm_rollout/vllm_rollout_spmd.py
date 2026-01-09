@@ -199,7 +199,7 @@ class vLLMRollout(BaseRollout):
                 + f"max_position_embeddings={model_hf_config.max_position_embeddings}"
             )
 
-        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+        max_model_len = int(config.max_model_len or config.prompt_length + max(int(config.response_length), int(config.val_kwargs.max_tokens)))
 
         # This parameter verification is borrowed from vllm:
         # https://github.com/vllm-project/vllm/blob/561253b37faadaafe68168ea32d8d8157621a6b4/vllm/config/scheduler.py#L249
@@ -360,6 +360,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        max_len = None
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -368,7 +369,9 @@ class vLLMRollout(BaseRollout):
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
+                "max_tokens": int(self.config.response_length),
             }
+            max_len = int(self.config.response_length)
         elif is_validate:
             # TODO: try **
             kwargs = {
@@ -376,7 +379,9 @@ class vLLMRollout(BaseRollout):
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
+                "max_tokens": int(self.config.val_kwargs.max_tokens),
             }
+            max_len = int(self.config.val_kwargs.max_tokens)
 
         lora_requests = None
         if self.lora_kwargs:
@@ -411,12 +416,12 @@ class vLLMRollout(BaseRollout):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=max_len).to(
                 idx.device
             )
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
+                    rollout_log_probs, -1, max_length=max_len,
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 

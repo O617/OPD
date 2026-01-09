@@ -141,6 +141,9 @@ val_kwargs:
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
 
+  # Max number of tokens generated when validate
+  max_tokens: 16384
+
 # Multi-turn interaction config for tools or chat.
 multi_turn:
 

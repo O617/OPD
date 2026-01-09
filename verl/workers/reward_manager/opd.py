@@ -358,37 +358,73 @@ class OPDRewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        is_validate = data.meta_info.get("validate", False)
 
         # For Evaluation
-        # already_print_data_sources = {}
+        if is_validate:
+            reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
 
-        # for i in range(len(data)):
-        #     data_item = data[i]  # DataProtoItem
+            already_print_data_sources = {}
 
-        #     prompt_ids = data_item.batch["prompts"]
+            for i in range(len(data)):
+                data_item = data[i]  # DataProtoItem
 
-        #     prompt_length = prompt_ids.shape[-1]
+                prompt_ids = data_item.batch["prompts"]
 
-        #     valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
-        #     valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+                prompt_length = prompt_ids.shape[-1]
 
-        #     response_ids = data_item.batch["responses"]
-        #     valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
-        #     valid_response_ids = response_ids[:valid_response_length]
-        #     if self.overlong_buffer_cfg.enable:
-        #         overlong_buffer_len = self.overlong_buffer_cfg.len
-        #         expected_len = self.max_resp_len - overlong_buffer_len
-        #         exceed_len = valid_response_length - expected_len
-        #         overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
-        #         overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
-        #         reward += overlong_reward
-        #         if self.overlong_buffer_cfg.log:
-        #             reward_extra_info["overlong_reward"].append(overlong_reward)
-        #             reward_extra_info["overlong"].append(overlong_reward < 0)
+                valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-        #     reward_tensor[i, valid_response_length - 1] = reward
+                response_ids = data_item.batch["responses"]
+                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                valid_response_ids = response_ids[:valid_response_length]
 
-        reward = self.teacher_client.get_teacher_knowledge(data, False)
+                # decode
+                prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+                response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+
+                ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+                data_source = data_item.non_tensor_batch[self.reward_fn_key]
+                extra_info = data_item.non_tensor_batch.get("extra_info", {})
+                num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
+                rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+                extra_info["num_turns"] = num_turns
+                extra_info["rollout_reward_scores"] = rollout_reward_scores
+
+                score = default_compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+
+                if isinstance(score, dict):
+                    reward = score["score"]
+                    # Store the information including original reward
+                    for key, value in score.items():
+                        reward_extra_info[key].append(value)
+                else:
+                    reward = score
+
+                reward_tensor[i, valid_response_length - 1] = reward
+
+                if data_source not in already_print_data_sources:
+                    already_print_data_sources[data_source] = 0
+
+                if already_print_data_sources[data_source] < self.num_examine:
+                    already_print_data_sources[data_source] += 1
+                    print("[prompt]", prompt_str)
+                    print("[response]", response_str)
+                    print("[ground_truth]", ground_truth)
+                    if isinstance(score, dict):
+                        for key, value in score.items():
+                            print(f"[{key}]", value)
+                    else:
+                        print("[score]", score)
+            reward = reward_tensor
+        else:
+            reward = self.teacher_client.get_teacher_knowledge(data, False)
 
         if return_dict:
             return {

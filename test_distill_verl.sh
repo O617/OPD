@@ -36,17 +36,19 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 # MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
-MODEL_PATH="/data/main/hanxiao/Qwen3-1.7B"
+MODEL_PATH="/data/main/hanxiao/Llama-3.2-1B"
 # MODEL_PATH="/data/main/hanxiao/Qwen3-1.7B"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 # TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TRAIN_FILE="/home/hanxiao/develop/Distill/verl/recipe/gkd/data/DAPO-17k/data/dapo-math-17k.parquet"
+# TRAIN_FILE="/home/hanxiao/develop/Distill/verl/recipe/gkd/data/DAPO-17k/data/dapo-math-17k.parquet"
+TRAIN_FILE="/home/hanxiao/develop/Distill/OPD/deepmath_messages.parquet"
 # TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 TEST_FILE="/home/hanxiao/develop/Distill/verl/recipe/gkd/data/aime_2024/output_data.parquet"
 
 export TEACHER_SERVER_IP="127.0.0.1"
 export TEACHER_SERVER_PORT="15555"
 export TEACHER_N_WORKERS="1"
+export TEACHER_CKPT_PATH="/data/main/hanxiao/Qwen3-32B"
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG=legacy
 
@@ -129,7 +131,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq=5 \
     trainer.save_freq=10 \
     trainer.total_epochs=10 \

@@ -32,6 +32,8 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
+from transformers import AutoTokenizer
+
 teacher_topk_logps_padded, teacher_topk_indices_padded = None, None
 DEBUG = False
 
@@ -87,6 +89,7 @@ class TeacherClient:
         self,
         server_ip,
         server_port,
+        teacher_ckpt_path,
         num_microbatches=1,
         max_tokens=1,
         n_server_workers=1,
@@ -105,7 +108,54 @@ class TeacherClient:
         self.temperature = temperature
         self.only_response = only_response
         self.max_seq_len = max_seq_len
+        self.tokenizer = AutoTokenizer.from_pretrained(teacher_ckpt_path)
+        self.student_tokenizer = None
         self._run()
+
+    def retokenize_batch(self, batch):
+        if self.tokenizer == self.student_tokenizer:
+            return batch
+        else:
+            input_id_list = []
+            bsz = len(batch)
+            max_seq_len = 0
+
+            for seq_idx in range(bsz):
+                seq_str = ""
+                input_ids_list = batch[seq_idx]
+                token_idx = 0
+                counter = 0
+                while token_idx < len(input_ids_list):
+                    counter = token_idx
+                    if input_ids_list[token_idx] == self.student_tokenizer.bos_token_id:
+                        while(input_ids_list[token_idx] != self.student_tokenizer.eos_token_id and token_idx < len(input_ids_list) - 1): token_idx += 1
+                        seq_str += self.tokenizer.decode(self.tokenizer.bos_token_id)
+                        seq_str += self.student_tokenizer.decode(input_ids_list[counter + 1:token_idx])
+                        if input_ids_list[token_idx] == self.student_tokenizer.eos_token_id:
+                            seq_str += self.tokenizer.decode(self.tokenizer.eos_token_id)
+                        else:
+                            seq_str += self.student_tokenizer.decode(input_ids_list[token_idx])
+                        token_idx += 1
+                    else:
+                        while(input_ids_list[token_idx] != self.student_tokenizer.bos_token_id and token_idx < len(input_ids_list) - 1): token_idx += 1
+                        seq_str += self.student_tokenizer.decode(input_ids_list[counter:token_idx])
+                        if input_ids_list[token_idx] == self.student_tokenizer.bos_token_id:
+                            pass
+                        else:
+                            seq_str += self.student_tokenizer.decode(input_ids_list[token_idx])
+                            token_idx += 1
+                new_input_id = self.tokenizer(seq_str)['input_ids']
+                max_seq_len = max(max_seq_len, len(new_input_id))
+                # print(self.student_tokenizer.decode(input_ids_list) == seq_str)
+                input_id_list.append(new_input_id)
+
+            # new_input_ids = torch.full([bsz, max_seq_len], self.tokenizer.eos_token_id, dtype=torch.int32)
+
+            # for seq_idx in range(bsz):
+            #     new_input_id = input_id_list[seq_idx]
+            #     new_input_ids[seq_idx, : new_input_id.size()] = new_input_id
+            return input_id_list
+                
 
     def bg_task(self):
         socket = self.context.socket(zmq.REQ)
@@ -126,6 +176,7 @@ class TeacherClient:
                         futures.append(future)
                         batch.extend(data.tolist() if isinstance(data, torch.Tensor) else data)
 
+                batch = self.retokenize_batch(batch)
                 if self.max_seq_len:
                     max_tokens = [min(self.max_tokens, self.max_seq_len - len(prompt)) for prompt in batch]
                     request = {"prompt_token_ids": batch, "max_tokens": max_tokens}
@@ -191,7 +242,7 @@ class TeacherClient:
     def __del__(self):
         self.context.destroy()
 
-    def get_teacher_knowledge(self, batch: DataProto, is_async=False):
+    def get_teacher_knowledge(self, batch: DataProto, is_async=False, student_tokenizer=None):
         """
         Retrieve teacher model's top-k predictions and log probabilities for knowledge distillation.
 
@@ -207,6 +258,8 @@ class TeacherClient:
             RuntimeError: If teacher model request fails
         """
 
+        assert student_tokenizer is not None, "To get knowledge of teacher, tokenizer of student must be passed"
+        self.student_tokenizer = student_tokenizer
         input_ids = []
         attention_mask = batch.batch["attention_mask"].to(torch.bool)
         # response_length = batch.meta_info["response_length"]
@@ -279,34 +332,73 @@ class TeacherClient:
                 teacher_topk_indices_padded.zero_()
 
             batch_size = attention_mask.size(0)
+
+            def response_alignment(teacher_log_probs, student_token_ids, teacher_token_ids):
+                assert len(self.tokenizer.decode(teacher_token_ids)) >= len(self.student_tokenizer.decode(student_token_ids)), "Output string length of teacher model must be not less than student's"
+                if self.tokenizer.decode(teacher_token_ids).startswith(self.student_tokenizer.decode(student_token_ids)):
+                    return teacher_log_probs, student_token_ids, teacher_token_ids
+                else:
+                    for i in range(len(teacher_token_ids)):
+                        if (self.tokenizer.decode(teacher_token_ids[i:]).startswith(self.student_tokenizer.decode(student_token_ids))):
+                            return teacher_log_probs[i:], student_token_ids, teacher_token_ids[i:]
+                    return None, None, None
+                
+            def post_process_teacher_log_probs(teacher_log_probs, student_token_ids, teacher_token_ids):
+                assert teacher_log_probs is not None, "teacher_log_probs should not be None"
+                if self.tokenizer == student_tokenizer:
+                    return teacher_log_probs
+                new_teacher_log_probs = torch.zeros(len(student_token_ids) + 1, dtype=teacher_log_probs.dtype, device=teacher_log_probs.device)
+                new_teacher_log_probs[-1] = teacher_log_probs[-1]
+                
+                counter_tec_seq, token_idx = 0, 0
+                std_chunk, tec_chunk = [], []
+                cat_str = ""
+                
+                while token_idx < len(student_token_ids) or counter_tec_seq < len(teacher_token_ids):
+                    tec_chunk_str = self.tokenizer.decode(tec_chunk)
+                    std_chunk_str = self.student_tokenizer.decode(std_chunk)
+                    if (token_idx == len(student_token_ids) or (student_token_ids[token_idx] == self.tokenizer.eos_token_id) or (student_token_ids[token_idx] == self.tokenizer.bos_token_id)):
+                        while((counter_tec_seq < len(teacher_token_ids)) and (teacher_token_ids[counter_tec_seq] != self.tokenizer.eos_token_id or teacher_token_ids[counter_tec_seq] != self.tokenizer.bos_token_id)): 
+                            tec_chunk.append(teacher_token_ids[counter_tec_seq])
+                            counter_tec_seq += 1
+                        cat_str += std_chunk_str
+                        new_teacher_log_probs[token_idx - len(std_chunk):token_idx] = teacher_log_probs[counter_tec_seq - len(tec_chunk):counter_tec_seq].sum() / len(std_chunk)
+                        new_teacher_log_probs[token_idx] = teacher_log_probs[counter_tec_seq] if std_chunk[-1] == self.tokenizer.eos_token_id else new_teacher_log_probs[token_idx]
+                        std_chunk, tec_chunk = [], []
+                    elif (len(tec_chunk_str) > len(tec_chunk_str)):
+                        std_chunk.append(student_token_ids[token_idx]) 
+                        token_idx += 1
+                    elif (len(tec_chunk_str) < len(std_chunk_str)):
+                        tec_chunk.append(teacher_token_ids[counter_tec_seq])
+                        counter_tec_seq += 1
+                    elif (len(std_chunk) == 0):
+                        std_chunk.append(student_token_ids[token_idx])
+                        token_idx += 1
+                    elif tec_chunk_str != std_chunk_str:
+                        std_chunk.append(student_token_ids[token_idx])
+                        token_idx += 1
+                    else:
+                        assert tec_chunk_str == std_chunk_str, "Student's token chunk doesn't match teacher's"
+                        cat_str += std_chunk_str
+                        new_teacher_log_probs[token_idx - len(std_chunk):token_idx] = teacher_log_probs[counter_tec_seq - len(tec_chunk):counter_tec_seq].sum() / len(std_chunk)
+                        std_chunk, tec_chunk = [], []
+                
+                # if cat_str != self.student_tokenizer.decode(student_token_ids):breakpoint()
+                # assert cat_str == self.student_tokenizer.decode(student_token_ids), "Joint of Token chunk must match source token sequence"
+                return new_teacher_log_probs
+                            
+
             for i in range(batch_size):
-                # teacher_topk_logp = torch.zeros_like(teacher_topk_logps[i][:, 0])
-                # teacher_topk_logp[1:] = teacher_topk_logps[i][:-1, 0]
-                teacher_topk_logps_padded[i, attention_mask[i]] = teacher_topk_logps[i][:, 0]
-                # breakpoint()
-            #   teacher_topk_indices_padded[i, attention_mask[i]] = teacher_topk_indices[i][:, 0]
+                print(f"Data ID {i}")
+                try:
+                    teacher_log_probs, student_token_ids, teacher_token_ids = response_alignment(teacher_topk_logps[i][:, 0], input_ids[i][1:], responses[i][1:])
+                    teacher_topk_logps_padded[i, attention_mask[i]] = post_process_teacher_log_probs(teacher_log_probs, student_token_ids, teacher_token_ids)
+                except Exception as e:
+                    import warnings
+                    warnings.warn(f"Error in post_process_teacher_log_probs: {e}. Setting teacher_topk_logps_padded to zeros.")
+                    teacher_topk_logps_padded[i, attention_mask[i]] = torch.zeros_like(teacher_topk_logps_padded[i, attention_mask[i]])
 
             return teacher_topk_logps_padded
-
-            # output_batch = DataProto.from_single_dict(
-            #     data={"real_seq_lens": real_seq_lens},
-            # )
-
-            # output_batch.non_tensor_batch.update(
-            #     {
-            #         "teacher_topk_logps": teacher_topk_logps_padded.numpy(),
-            #         "teacher_topk_indices": teacher_topk_indices_padded.numpy(),
-            #     }
-            # )
-
-            # tok2 = time.time()
-            # output_batch = {
-            #     "teacher_topk_logps": teacher_topk_logps_padded,
-            #     "teacher_topk_indices": teacher_topk_indices_padded
-            # }
-            # output_batch.meta_info["timing"] = {"get_teacher_knowledge": (tok1 - tik1) + (tok2 - tik2)}
-
-            # return output_batch
 
         if is_async:
             return SimpleNamespace(get=handle_futures)
@@ -325,24 +417,14 @@ class OPDRewardManager(AbstractRewardManager):
         compute_score=None,
         reward_fn_key="data_source",
         max_resp_len=None,
-        overlong_buffer_cfg=None,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.reward_fn_key = reward_fn_key
-        self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
         self.teacher_client = TeacherClient(
-            os.environ['TEACHER_SERVER_IP'], int(os.environ['TEACHER_SERVER_PORT']), n_server_workers=int(os.environ['TEACHER_N_WORKERS'])
+            os.environ['TEACHER_SERVER_IP'], int(os.environ['TEACHER_SERVER_PORT']), n_server_workers=int(os.environ['TEACHER_N_WORKERS']), teacher_ckpt_path=os.environ['TEACHER_CKPT_PATH'],
         )
-
-        if self.overlong_buffer_cfg is not None:
-            assert self.max_resp_len is not None, (
-                f"max_resp_len must be provided if {overlong_buffer_cfg=}, but got None"
-            )
-            assert self.max_resp_len >= self.overlong_buffer_cfg.len, (
-                "max_resp_len must be larger than overlong_buffer.len"
-            )
 
     def __call__(self, data: DataProto, return_dict: bool = False):
         """We will expand this function gradually based on the available datasets"""
@@ -424,7 +506,7 @@ class OPDRewardManager(AbstractRewardManager):
                         print("[score]", score)
             reward = reward_tensor
         else:
-            reward = self.teacher_client.get_teacher_knowledge(data, False)
+            reward = self.teacher_client.get_teacher_knowledge(data, False, self.tokenizer)
 
         if return_dict:
             return {

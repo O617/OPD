@@ -174,7 +174,7 @@ class VLLMEngine:
 
         responses, teacher_topk_logprobs, teacher_topk_indices = [], [], []
         for output in outputs:
-            responses.append(torch.tensor(output.outputs[0].token_ids, dtype=torch.int32))
+            responses.append(torch.tensor(output.prompt_token_ids + output.outputs[0].token_ids, dtype=torch.int32))
             if self.n_logprobs > 0:
                 response_topk_logprobs = torch.tensor(
                     [x.logprobs[0] for x in output.outputs[0].logprobs],

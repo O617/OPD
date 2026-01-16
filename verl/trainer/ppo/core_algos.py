@@ -1044,9 +1044,6 @@ def compute_policy_loss_opd(
     """
     Compute the clipped policy objective and related metrics for OPD.
 
-    Adapted from
-    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
-
     Args:
         old_log_prob (torch.Tensor):
             Log-probabilities of actions under the old policy, shape (batch_size, response_length).
@@ -1066,11 +1063,23 @@ def compute_policy_loss_opd(
     
     student_log_probs = log_prob.detach()
     with torch.no_grad():
-        teacher_log_probs = advantages
+        def compute_chunk_level_log_probs():
+            bsz, seqlen = teacher_log_probs.shape
+            for seq_id in range(bsz):
+                counter = 0
+                teacher_seq = teacher_log_probs[seq_id]
+                student_seq = student_log_probs[seq_id]
+                for token_idx in range(seqlen):
+                    if teacher_seq[token_idx] == teacher_seq[counter]: 
+                        continue
+                    else:
+                        student_log_probs[seq_id, counter:token_idx] = torch.mean(student_seq[counter:token_idx])
+                        counter = token_idx
+
         response_length = student_log_probs.shape[-1]
-        # breakpoint()
-        advantages = teacher_log_probs[..., -response_length -1: -1] - student_log_probs
-        # breakpoint()
+        teacher_log_probs = advantages[..., -response_length -1: -1]
+        compute_chunk_level_log_probs()
+        advantages = teacher_log_probs - student_log_probs
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)

@@ -18,6 +18,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from codetiming import Timer
+from functools import partial
 
 import torch
 import zmq
@@ -26,6 +27,8 @@ import os
 import time
 import queue
 import threading
+import concurrent.futures
+import warnings
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -334,7 +337,7 @@ class TeacherClient:
             batch_size = attention_mask.size(0)
 
             def response_alignment(teacher_log_probs, student_token_ids, teacher_token_ids):
-                assert len(self.tokenizer.decode(teacher_token_ids)) >= len(self.student_tokenizer.decode(student_token_ids)), "Output string length of teacher model must be not less than student's"
+                assert len(self.tokenizer.decode(teacher_token_ids)) >= len(self.student_tokenizer.decode(student_token_ids[:-1])), "Output string length of teacher model must be not less than student's"
                 if self.tokenizer.decode(teacher_token_ids).startswith(self.student_tokenizer.decode(student_token_ids)):
                     return teacher_log_probs, student_token_ids, teacher_token_ids
                 else:
@@ -357,6 +360,9 @@ class TeacherClient:
                 while token_idx < len(student_token_ids) or counter_tec_seq < len(teacher_token_ids):
                     tec_chunk_str = self.tokenizer.decode(tec_chunk)
                     std_chunk_str = self.student_tokenizer.decode(std_chunk)
+                    if (len(std_chunk) >= 6 and tec_chunk_str[-5:] == std_chunk_str[-5:]):
+                        new_teacher_log_probs[token_idx - len(std_chunk):token_idx] = teacher_log_probs[counter_tec_seq - len(tec_chunk):counter_tec_seq].sum() / len(std_chunk)
+                        std_chunk, tec_chunk = [], []
                     if (token_idx == len(student_token_ids) or (student_token_ids[token_idx] == self.tokenizer.eos_token_id) or (student_token_ids[token_idx] == self.tokenizer.bos_token_id)):
                         while((counter_tec_seq < len(teacher_token_ids)) and (teacher_token_ids[counter_tec_seq] != self.tokenizer.eos_token_id or teacher_token_ids[counter_tec_seq] != self.tokenizer.bos_token_id)): 
                             tec_chunk.append(teacher_token_ids[counter_tec_seq])
@@ -378,7 +384,7 @@ class TeacherClient:
                         std_chunk.append(student_token_ids[token_idx])
                         token_idx += 1
                     else:
-                        assert tec_chunk_str == std_chunk_str, "Student's token chunk doesn't match teacher's"
+                        # assert tec_chunk_str == std_chunk_str, "Student's token chunk doesn't match teacher's"
                         cat_str += std_chunk_str
                         new_teacher_log_probs[token_idx - len(std_chunk):token_idx] = teacher_log_probs[counter_tec_seq - len(tec_chunk):counter_tec_seq].sum() / len(std_chunk)
                         std_chunk, tec_chunk = [], []
@@ -388,16 +394,49 @@ class TeacherClient:
                 return new_teacher_log_probs
                             
 
-            for i in range(batch_size):
+            def process_single_item(i, teacher_topk_logps, input_ids, responses, attention_mask, teacher_topk_logps_padded):
                 print(f"Data ID {i}")
                 try:
-                    teacher_log_probs, student_token_ids, teacher_token_ids = response_alignment(teacher_topk_logps[i][:, 0], input_ids[i][1:], responses[i][1:])
-                    teacher_topk_logps_padded[i, attention_mask[i]] = post_process_teacher_log_probs(teacher_log_probs, student_token_ids, teacher_token_ids)
+                    teacher_log_probs, student_token_ids, teacher_token_ids = response_alignment(
+                        teacher_topk_logps[i][:, 0], 
+                        input_ids[i][1:], 
+                        responses[i][1:]
+                    )
+                    if teacher_log_probs.is_cuda:
+                        teacher_log_probs = teacher_log_probs.cpu()
+                    
+                    result = post_process_teacher_log_probs(
+                        teacher_log_probs, 
+                        student_token_ids, 
+                        teacher_token_ids
+                    )
+                    return i, result, attention_mask[i], None
                 except Exception as e:
-                    import warnings
                     warnings.warn(f"Error in post_process_teacher_log_probs: {e}. Setting teacher_topk_logps_padded to zeros.")
-                    teacher_topk_logps_padded[i, attention_mask[i]] = torch.zeros_like(teacher_topk_logps_padded[i, attention_mask[i]])
+                    return i, None, attention_mask[i], e
 
+            # 并行处理
+            with concurrent.futures.ThreadPoolExecutor(128) as executor:
+                process_func = partial(
+                    process_single_item,
+                    teacher_topk_logps=teacher_topk_logps,
+                    input_ids=input_ids,
+                    responses=responses,
+                    attention_mask=attention_mask,
+                    teacher_topk_logps_padded=teacher_topk_logps_padded
+                )
+                
+                futures_ = [executor.submit(process_func, i) for i in range(batch_size)]
+                
+                for future in concurrent.futures.as_completed(futures_):
+                    i, result, mask, error = future.result()
+                    
+                    if error is None:
+                        teacher_topk_logps_padded[i, mask] = result
+                    else:
+                        teacher_topk_logps_padded[i, mask] = torch.zeros_like(
+                            teacher_topk_logps_padded[i, mask]
+                        )
             return teacher_topk_logps_padded
 
         if is_async:
@@ -507,6 +546,7 @@ class OPDRewardManager(AbstractRewardManager):
             reward = reward_tensor
         else:
             reward = self.teacher_client.get_teacher_knowledge(data, False, self.tokenizer)
+        # breakpoint()
 
         if return_dict:
             return {

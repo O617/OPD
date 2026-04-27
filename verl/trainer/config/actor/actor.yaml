@@ -68,6 +68,11 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # For OPD loss only. If set, clamps per-token advantage (teacher_logp - student_logp)
+  # to [-v, v] before PPO. Analogous to verl's official `DistillationLossConfig.loss_max_clamp`.
+  # null disables the clamp.
+  opd_loss_max_clamp: null
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

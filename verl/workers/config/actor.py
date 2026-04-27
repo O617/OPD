@@ -41,6 +41,9 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        opd_loss_max_clamp (Optional[float]): For OPD loss only. If set, clamps per-token advantage
+            (teacher_logp - student_logp) to [-v, v] before the PPO step, analogous to verl's
+            official `DistillationLossConfig.loss_max_clamp`. None disables the clamp.
     """
 
     loss_mode: str = "vanilla"
@@ -49,6 +52,7 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    opd_loss_max_clamp: Optional[float] = None
 
 
 @dataclass

@@ -464,4 +464,21 @@ def create_rl_sampler(data_config, dataset):
 
 
 if __name__ == "__main__":
+    import os
+    import ray
+
+    os.environ['TEACHER_SERVER_IP'] = "<REDACTED_IP>"
+    os.environ['TEACHER_SERVER_PORT'] = "15555"
+    os.environ['TEACHER_N_WORKERS'] = "1"
+    os.environ['TEACHER_CKPT_PATH'] = "$DATA_ROOT/Qwen3-8B"
+
+    if not ray.is_initialized():
+        ray.init(address="auto", runtime_env={
+            "env_vars": {
+                "TEACHER_SERVER_IP": "<REDACTED_IP>",
+                "TEACHER_SERVER_PORT": "15555",
+                "TEACHER_N_WORKERS": "1",
+                "TEACHER_CKPT_PATH": "$DATA_ROOT/Qwen3-8B"
+            }
+        })
     main()

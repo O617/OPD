@@ -462,6 +462,11 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                    # # DEBUG: stash input_ids/responses so compute_policy_loss_opd can print them
+                    # from verl.trainer.ppo import core_algos as _ca
+                    # _ca._DEBUG_INPUT_IDS = model_inputs.get("input_ids", None)
+                    # _ca._DEBUG_RESPONSES = model_inputs.get("responses", None)
+
                     # Compute policy loss (any function is expected to return 2 values)
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,

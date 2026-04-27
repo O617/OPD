@@ -360,7 +360,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
-        max_len = None
+        max_len = int(self.config.response_length)
         if not do_sample:
             kwargs = {
                 "best_of": 1,

@@ -1070,16 +1070,107 @@ def compute_policy_loss_opd(
                 teacher_seq = teacher_log_probs[seq_id]
                 student_seq = student_log_probs[seq_id]
                 for token_idx in range(seqlen):
-                    if teacher_seq[token_idx] == teacher_seq[counter]: 
+                    if teacher_seq[token_idx] == teacher_seq[counter]:
                         continue
                     else:
                         student_log_probs[seq_id, counter:token_idx] = torch.mean(student_seq[counter:token_idx])
                         counter = token_idx
 
         response_length = student_log_probs.shape[-1]
-        teacher_log_probs = advantages[..., -response_length -1: -1]
-        compute_chunk_level_log_probs()
+        teacher_log_probs = advantages[..., -response_length:]
+        # Special token positions are marked with inf sentinel (real logprobs ∈ (-inf, 0]).
+        # Replace them with student logprobs so advantage = 0 → no loss contribution.
+        sentinel_mask = torch.isinf(teacher_log_probs)
+        if sentinel_mask.any():
+            teacher_log_probs = torch.where(sentinel_mask, student_log_probs, teacher_log_probs)
+        # compute_chunk_level_log_probs()
         advantages = teacher_log_probs - student_log_probs
+
+        # Optional per-token advantage clamp (analogous to verl's `loss_max_clamp`).
+        # Prevents extreme teacher/student log-prob gaps (e.g. -30) from producing
+        # huge advantages that dominate the gradient for a single token.
+        # Set via Hydra override:
+        #   actor_rollout_ref.actor.policy_loss.opd_loss_max_clamp=10.0
+        # null (default) = no clamp.
+        opd_loss_max_clamp = None
+        policy_loss_cfg = config.get("policy_loss", None) if hasattr(config, "get") else None
+        if policy_loss_cfg is not None:
+            opd_loss_max_clamp = policy_loss_cfg.get("opd_loss_max_clamp", None)
+        if opd_loss_max_clamp is not None:
+            advantages = torch.clamp(advantages, min=-opd_loss_max_clamp, max=opd_loss_max_clamp)
+
+        # # ---- DEBUG: write seq 0 per-token student logprobs and advantages to file ----
+        # # Actor worker stdout is captured by Ray, so write to a file instead.
+        # # NOTE: no chunk merging — chunks would require metadata from reward worker;
+        # # here we dump per-token info so you can identify the seq via input_ids and
+        # # cross-reference with the reward-side alignment log.
+        # _debug_file = "<private-cephfs-path>"
+        # try:
+        #     tch_seq0 = teacher_log_probs[0]
+        #     stu_seq0 = student_log_probs[0]
+        #     adv_seq0 = advantages[0]
+        #     resp_mask_seq0 = response_mask[0].bool()
+        #     valid_len = int(resp_mask_seq0.sum().item())
+        #
+        #     # Pull input_ids/responses that dp_actor stashed on this module
+        #     _input_ids = globals().get("_DEBUG_INPUT_IDS", None)
+        #     _responses = globals().get("_DEBUG_RESPONSES", None)
+        #     _resp_ids0 = None
+        #     if _responses is not None:
+        #         _resp_ids0 = _responses[0].tolist()
+        #     _input_ids0 = None
+        #     if _input_ids is not None:
+        #         _input_ids0 = _input_ids[0].tolist()
+        #
+        #     with open(_debug_file, "w") as _f:
+        #         _f.write(f"teacher_log_probs.shape={teacher_log_probs.shape}, "
+        #                  f"student_log_probs.shape={student_log_probs.shape}, "
+        #                  f"advantages.shape={advantages.shape}, "
+        #                  f"response_mask.shape={response_mask.shape}\n")
+        #         _f.write(f"valid_len={valid_len}\n")
+        #         if _input_ids0 is not None:
+        #             _f.write(f"input_ids[0] (first 50): {_input_ids0[:50]}\n")
+        #             _f.write(f"input_ids[0] (last 20):  {_input_ids0[-20:]}\n")
+        #         if _resp_ids0 is not None:
+        #             _f.write(f"responses[0] (first 50): {_resp_ids0[:50]}\n")
+        #         _f.write("\n")
+        #
+        #         if valid_len > 0:
+        #             tch_valid = tch_seq0[:valid_len]
+        #             stu_valid = stu_seq0[:valid_len]
+        #             adv_valid = adv_seq0[:valid_len]
+        #
+        #             _f.write("=" * 80 + "\n")
+        #             _f.write(f"[OPD LOSS DEBUG] seq 0: per-token teacher/student/advantage\n")
+        #             _f.write(f"(response_length={response_length}, valid_len={valid_len})\n")
+        #             _f.write("=" * 80 + "\n")
+        #             _f.write(f"{'pos':>4s}  {'tok_id':>7s}  {'teacher':>10s}  {'student':>10s}  {'advantage':>10s}\n")
+        #             _f.write("-" * 80 + "\n")
+        #
+        #             for idx in range(valid_len):
+        #                 tok_id = _resp_ids0[idx] if (_resp_ids0 is not None and idx < len(_resp_ids0)) else -1
+        #                 _f.write(f"{idx:>4d}  {tok_id:>7d}  "
+        #                          f"{tch_valid[idx].item():>10.4f}  "
+        #                          f"{stu_valid[idx].item():>10.4f}  "
+        #                          f"{adv_valid[idx].item():>10.4f}\n")
+        #
+        #             _f.write("\n" + "=" * 80 + "\n")
+        #             _f.write(f"[SUMMARY seq 0] adv mean={adv_valid.mean().item():.4f}, "
+        #                      f"std={adv_valid.std().item():.4f}, "
+        #                      f"min={adv_valid.min().item():.4f}, "
+        #                      f"max={adv_valid.max().item():.4f}\n")
+        #             _f.write(f"[SUMMARY seq 0] tch mean={tch_valid.mean().item():.4f}, "
+        #                      f"stu mean={stu_valid.mean().item():.4f}\n")
+        #             _f.write("=" * 80 + "\n")
+        #         else:
+        #             _f.write("valid_len=0, no debug output\n")
+        # except Exception:
+        #     import traceback
+        #     with open(_debug_file, "a") as _f:
+        #         traceback.print_exc(file=_f)
+        # # ---- END DEBUG ----
+
+    # breakpoint()
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)

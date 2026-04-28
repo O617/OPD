@@ -135,7 +135,15 @@ class LogprobsTensors(NamedTuple):
 
 
 class VLLMEngine:
-    def __init__(self, ckpt_path, n_logprobs=0, tp_size=1):
+    def __init__(
+        self,
+        ckpt_path,
+        n_logprobs=0,
+        tp_size=1,
+        gpu_memory_utilization=0.5,
+        max_num_batched_tokens=8192,
+        max_model_len=30720,
+    ):
         self.n_logprobs = n_logprobs
         # self.llm = LLM(ckpt_path, tensor_parallel_size=tp_size, trust_remote_code=True,
         #                enable_chunked_prefill=False, distributed_executor_backend="ray",
@@ -146,9 +154,9 @@ class VLLMEngine:
             trust_remote_code=True,
             enable_chunked_prefill=True,
             max_logprobs=n_logprobs,
-            gpu_memory_utilization=0.5,
-            max_num_batched_tokens=8192,
-            max_model_len=10240,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
         )
 
     def get_topk_logprobs(self, prompt_token_ids, temperature=0.8, max_new_tokens=1, only_response=False):
@@ -174,6 +182,9 @@ class VLLMEngine:
 
         responses, teacher_topk_logprobs, teacher_topk_indices = [], [], []
         for output in outputs:
+            #responses.append(torch.tensor(output.outputs[0].token_ids, dtype=torch.int32))
+            print('len(output.prompt_token_ids):', len(output.prompt_token_ids))
+            print('len(output.outputs[0].token_ids):', len(output.outputs[0].token_ids))
             responses.append(torch.tensor(output.prompt_token_ids + output.outputs[0].token_ids, dtype=torch.int32))
             if self.n_logprobs > 0:
                 response_topk_logprobs = torch.tensor(

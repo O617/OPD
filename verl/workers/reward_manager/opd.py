@@ -673,8 +673,6 @@ class TeacherClient:
                     # logps[N-1] predicts token N (doesn't exist / last+1), skip it
                     n_fill = min(len(logps) - 1, len(valid_pos) - 1)
                     teacher_topk_logps_padded[i, valid_pos[1:1+n_fill]] = logps[:n_fill]
-                # Same tokenizer: no inf produced, return empty reason mask.
-                inf_reason_mask = torch.zeros_like(teacher_topk_logps_padded, dtype=torch.int8)
                 return teacher_topk_logps_padded
 
             # ============================================================

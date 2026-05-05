@@ -1081,6 +1081,12 @@ def compute_policy_loss_opd(
         # Special token positions are marked with inf sentinel (real logprobs ∈ (-inf, 0]).
         # Replace them with student logprobs so advantage = 0 → no loss contribution.
         sentinel_mask = torch.isinf(teacher_log_probs)
+        # --- OPD metrics: count inf tokens in this micro-batch ---
+        resp_mask_bool = response_mask.bool()
+        opd_inf_tokens = int((sentinel_mask & resp_mask_bool).sum().item())
+        opd_valid_tokens = int(response_mask.sum().item())
+        opd_inf_ratio = opd_inf_tokens / max(opd_valid_tokens, 1)
+        # ---
         if sentinel_mask.any():
             teacher_log_probs = torch.where(sentinel_mask, student_log_probs, teacher_log_probs)
         # compute_chunk_level_log_probs()
@@ -1229,6 +1235,8 @@ def compute_policy_loss_opd(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/opd_inf_tokens": opd_inf_tokens,
+        "actor/opd_inf_ratio": opd_inf_ratio,
     }
     return pg_loss, pg_metrics
 

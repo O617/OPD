@@ -28,6 +28,7 @@ import time
 import queue
 import threading
 import concurrent.futures
+import unicodedata
 import warnings
 
 from verl import DataProto
@@ -102,6 +103,8 @@ class TeacherClient:
     ) -> None:
         self.server_ip = server_ip
         self.server_port = server_port
+        # self.server_ip = "<internal-ip>"
+        # self.server_port = 15555
         self.num_microbatches = num_microbatches
         self.n_server_workers = n_server_workers
         self.max_tokens = max_tokens
@@ -111,6 +114,7 @@ class TeacherClient:
         self.temperature = temperature
         self.only_response = only_response
         self.max_seq_len = max_seq_len
+        self.large_chunk_threshold = int(os.environ.get('OPD_LARGE_CHUNK_THRESHOLD', '6'))
         self.tokenizer = AutoTokenizer.from_pretrained(teacher_ckpt_path)
         self.student_tokenizer = None
         self._same_tokenizer = None  # cached result of tokenizer comparison
@@ -218,7 +222,8 @@ class TeacherClient:
 
     @staticmethod
     def _align_chunks(student_ids, teacher_ids, teacher_logps,
-                      student_tokenizer, teacher_tokenizer, debug=False):
+                      student_tokenizer, teacher_tokenizer, debug=False,
+                      large_chunk_threshold=6):
         """Align teacher logprobs to student token granularity via chunk-level greedy matching.
 
         Both student_ids and teacher_ids should be the *response content only*
@@ -238,11 +243,15 @@ class TeacherClient:
             student_tokenizer: student's tokenizer
             teacher_tokenizer: teacher's tokenizer
             debug: bool, if True print alignment visualization
+            large_chunk_threshold: int, chunks with n_stu or n_tec exceeding this
+                threshold are marked with inf sentinel (unreliable alignment from
+                consecutive replacement characters). Default=6.
 
         Returns:
-            (aligned, chunk_details) where:
+            (aligned, chunk_details, teacher_truncated) where:
                 aligned: Tensor [len(student_ids)], aligned logprobs for each student token
                 chunk_details: list of dicts with per-chunk info (only populated when debug=True)
+                teacher_truncated: bool, True if teacher ran out before student
         """
         n_stu = len(student_ids)
         n_tec = len(teacher_ids)
@@ -270,14 +279,22 @@ class TeacherClient:
             matched = False
 
             while s_end <= n_stu and t_end <= n_tec:
-                s_text = student_tokenizer.decode(student_ids[s_ptr:s_end], skip_special_tokens=False)
-                t_text = teacher_tokenizer.decode(teacher_ids[t_ptr:t_end], skip_special_tokens=False)
+                s_text = unicodedata.normalize('NFC', student_tokenizer.decode(student_ids[s_ptr:s_end], skip_special_tokens=False))
+                t_text = unicodedata.normalize('NFC', teacher_tokenizer.decode(teacher_ids[t_ptr:t_end], skip_special_tokens=False))
 
                 if s_text == t_text and not s_text.endswith('\ufffd'):
                     # Chunk boundary found
                     n_stu_tokens = s_end - s_ptr
+                    n_tec_tokens = t_end - t_ptr
                     chunk_logp = teacher_logps[t_ptr:t_end].sum()
-                    aligned[s_ptr:s_end] = chunk_logp / n_stu_tokens
+                    # Mark large chunks as inf sentinel \u2014 these are typically
+                    # consecutive U+FFFD (garbled output) runs where the averaged
+                    # teacher logprob is unreliable. Treated same as fallback:
+                    # advantage = 0 \u2192 no gradient on these positions.
+                    if n_stu_tokens > large_chunk_threshold or n_tec_tokens > large_chunk_threshold:
+                        aligned[s_ptr:s_end] = float('inf')
+                    else:
+                        aligned[s_ptr:s_end] = chunk_logp / n_stu_tokens
                     # if debug and not (n_stu_tokens == 1 and (t_end - t_ptr) == 1):
                     #     s_repr = repr(s_text)
                     #     print(f"  [multi-chunk {_chunk_count}] stu[{s_ptr}:{s_end}]({n_stu_tokens}t) <-> tec[{t_ptr}:{t_end}]({t_end-t_ptr}t)  "
@@ -784,7 +801,8 @@ class TeacherClient:
                 #       f"stu_resp_head10={student_resp_ids[:10]}")
                 aligned_logps, seq_chunk_details, teacher_truncated = self._align_chunks(
                     student_resp_ids, teacher_resp_ids, teacher_resp_logps,
-                    student_tokenizer, teacher_tokenizer, debug=False
+                    student_tokenizer, teacher_tokenizer, debug=False,
+                    large_chunk_threshold=self.large_chunk_threshold
                 )
                 # # DEBUG: print seq 0 chunk alignment detail (teacher side)
                 # if i == 0 and seq_chunk_details:
@@ -910,7 +928,7 @@ class OPDRewardManager(AbstractRewardManager):
 
     def __call__(self, data: DataProto, return_dict: bool = False):
         """We will expand this function gradually based on the available datasets"""
-
+        # breakpoint()
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
             if return_dict:
@@ -970,6 +988,10 @@ class OPDRewardManager(AbstractRewardManager):
                         reward_extra_info[key].append(value)
                 else:
                     reward = score
+                    # Normalize to dict format for consistent reward_extra_info across data sources
+                    reward_extra_info["score"].append(reward)
+                    reward_extra_info["acc"].append(reward > 0)
+                    reward_extra_info["pred"].append(None)
 
                 reward_tensor[i, valid_response_length - 1] = reward
 

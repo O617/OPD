@@ -467,18 +467,37 @@ if __name__ == "__main__":
     import os
     import ray
 
-    os.environ['TEACHER_SERVER_IP'] = "<internal-ip>"
-    os.environ['TEACHER_SERVER_PORT'] = "15555"
-    os.environ['TEACHER_N_WORKERS'] = "1"
-    os.environ['TEACHER_CKPT_PATH'] = "<private-cephfs-path>"
+    # Read teacher config from env (set by the launch script) with sensible
+    # defaults.  Same values are forwarded to every Ray worker via runtime_env
+    # so reward-manager workers (which spawn in separate processes) see them.
+    _teacher_env_keys = (
+        "TEACHER_SERVER_IP",
+        "TEACHER_SERVER_PORT",
+        "TEACHER_N_WORKERS",
+        "TEACHER_CKPT_PATH",
+        "TEACHER_MAX_SEQ_LEN",
+        # OPD: re-anchoring on fallback (kept for bench toggling); if set to
+        # wandb: project / entity / api key / mode forwarded so Ray-spawned
+        # workers can initialise the run even though they don't inherit the
+        # driver's shell env.
+        "WANDB_PROJECT",
+        "WANDB_ENTITY",
+        "WANDB_API_KEY",
+        "WANDB_MODE",
+        "WANDB_DIR",
+        "WANDB_RUN_GROUP",
+        "WANDB_NAME",
+    )
+    _teacher_env_defaults = {
+        "TEACHER_SERVER_IP": "<internal-ip>",
+        "TEACHER_SERVER_PORT": "15555",
+        "TEACHER_N_WORKERS": "1",
+        "TEACHER_CKPT_PATH": "<private-cephfs-path>",
+    }
+    for k, v in _teacher_env_defaults.items():
+        os.environ.setdefault(k, v)
+    _forward_env = {k: os.environ[k] for k in _teacher_env_keys if os.environ.get(k, "") != ""}
 
     if not ray.is_initialized():
-        ray.init(address="auto", runtime_env={
-            "env_vars": {
-                "TEACHER_SERVER_IP": "<internal-ip>",
-                "TEACHER_SERVER_PORT": "15555",
-                "TEACHER_N_WORKERS": "1",
-                "TEACHER_CKPT_PATH": "<private-cephfs-path>"
-            }
-        })
+        ray.init(address="auto", runtime_env={"env_vars": _forward_env})
     main()

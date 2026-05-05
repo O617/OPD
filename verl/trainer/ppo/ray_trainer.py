@@ -549,6 +549,20 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
+        # Allow per-data-source override of val n via config or environment variable
+        # e.g. data.val_n_override="HuggingFaceH4/MATH-500:1" means MATH-500 only generates 1 response
+        val_n_default = self.config.actor_rollout_ref.rollout.val_kwargs.n
+        val_n_overrides = {}
+        # Try config first (reliable via hydra), then env var as fallback
+        val_n_override_str = self.config.data.get("val_n_override", "") or os.environ.get("VAL_N_OVERRIDE", "")
+        print(f"[_validate] val_n_override = '{val_n_override_str}', val_n_default = {val_n_default}")
+        if val_n_override_str:
+            for item in str(val_n_override_str).split(","):
+                if ":" in item:
+                    ds, n = item.rsplit(":", 1)
+                    val_n_overrides[ds.strip()] = int(n.strip())
+        print(f"[_validate] val_n_overrides = {val_n_overrides}")
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -557,81 +571,95 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
+            # Split batch by data_source to apply per-source repeat_times (val n)
+            data_sources_in_batch = test_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * len(test_batch.batch)))
+            unique_sources = list(dict.fromkeys(data_sources_in_batch))  # preserve order, deduplicate
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+            # Group indices by data_source
+            source_to_indices = defaultdict(list)
+            for idx, ds in enumerate(data_sources_in_batch):
+                source_to_indices[ds].append(idx)
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            # Process each data_source sub-batch separately
+            for ds in unique_sources:
+                indices = source_to_indices[ds]
+                sub_batch = test_batch[indices]
+                repeat_times = val_n_overrides.get(ds, val_n_default)
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
+                # repeat sub-batch
+                sub_batch = sub_batch.repeat(repeat_times=repeat_times, interleave=True)
 
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+                # we only do validation on rule-based rm
+                if self.config.reward_model.enable and sub_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                    continue
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                # Store original inputs
+                input_ids = sub_batch.batch["input_ids"]
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                sample_inputs.extend(input_texts)
+                sample_uids.extend(sub_batch.non_tensor_batch["uid"])
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                ground_truths = [
+                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in sub_batch
+                ]
+                sample_gts.extend(ground_truths)
 
-            print("validation generation end")
+                test_gen_batch = self._get_gen_batch(sub_batch)
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}, data_source={ds}, n={repeat_times}, size={len(test_gen_batch.batch['input_ids'])}")
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                # pad to be divisible by dp_size
+                size_divisor = (
+                    self.actor_rollout_wg.world_size
+                    if not self.async_rollout_mode
+                    else self.config.actor_rollout_ref.rollout.agent.num_workers
+                )
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
-            # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                print(f"validation generation end for {ds}")
 
-            reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                sample_outputs.extend(output_texts)
 
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+                # Sync meta_info before union to avoid assertion on conflicting keys (e.g. 'timing')
+                test_output_gen_batch.meta_info = sub_batch.meta_info
+                sub_batch = sub_batch.union(test_output_gen_batch)
+                sub_batch.meta_info["validate"] = True
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+                # evaluate using reward_function
+                if self.val_reward_fn is None:
+                    raise ValueError("val_reward_fn must be provided for validation.")
+                result = self.val_reward_fn(sub_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_scores.extend(scores)
+
+                reward_extra_infos_dict["reward"].extend(scores)
+                if "reward_extra_info" in result:
+                    for key, lst in result["reward_extra_info"].items():
+                        reward_extra_infos_dict[key].extend(lst)
+
+                # collect num_turns of each prompt
+                if "__num_turns__" in sub_batch.non_tensor_batch:
+                    sample_turns.append(sub_batch.non_tensor_batch["__num_turns__"])
+
+                data_source_lst.append(sub_batch.non_tensor_batch.get("data_source", [ds] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 

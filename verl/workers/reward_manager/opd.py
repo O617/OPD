@@ -126,25 +126,41 @@ class TeacherClient:
             self._same_tokenizer = (self.tokenizer.get_vocab() == self.student_tokenizer.get_vocab())
         return self._same_tokenizer
 
+    def _detect_model_family(self, tokenizer):
+        """Detect the model family of a tokenizer based on its vocabulary. Result is cached.
+
+        Returns:
+            str: One of "llama", "qwen", or "unknown".
+        """
+        if not hasattr(self, '_family_cache'):
+            self._family_cache = {}
+        tok_id = id(tokenizer)
+        if tok_id not in self._family_cache:
+            vocab = tokenizer.get_vocab()
+            if "<|begin_of_text|>" in vocab:
+                self._family_cache[tok_id] = "llama"
+            elif "<|im_start|>" in vocab:
+                self._family_cache[tok_id] = "qwen"
+            else:
+                self._family_cache[tok_id] = "unknown"
+        return self._family_cache[tok_id]
+
     def _build_chat_template_mapping(self):
         """Build string replacement rules from student chat template to teacher chat template.
 
         Currently supports:
-            - LLaMA 3.x (student) -> Qwen3 (teacher)
+            - LLaMA 3.x (student) -> Qwen (teacher)
+            - Qwen (student) -> Qwen (teacher) [same chat template, no mapping needed]
 
         The mapping is a list of (old_str, new_str) tuples applied in order via str.replace().
         """
-        # Detect model families from vocab content
-        student_vocab = self.student_tokenizer.get_vocab()
-        teacher_vocab = self.tokenizer.get_vocab()
+        student_family = self._detect_model_family(self.student_tokenizer)
+        teacher_family = self._detect_model_family(self.tokenizer)
 
-        student_is_llama = "<|begin_of_text|>" in student_vocab
-        teacher_is_qwen = "<|im_start|>" in teacher_vocab
-
-        if student_is_llama and teacher_is_qwen:
-            # LLaMA 3.x -> Qwen3
+        if student_family == "llama" and teacher_family == "qwen":
+            # LLaMA 3.x -> Qwen
             # LLaMA format:  <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
-            # Qwen3 format:  <|im_start|>{role}\n{content}<|im_end|>\n
+            # Qwen format:   <|im_start|>{role}\n{content}<|im_end|>\n
             return [
                 # Must replace compound patterns first (longer -> shorter)
                 ("<|begin_of_text|><|start_header_id|>", "<|im_start|>"),
@@ -155,14 +171,15 @@ class TeacherClient:
                 ("<|begin_of_text|>", ""),
                 ("<|end_of_text|>", "<|im_end|>\n"),
             ]
-        elif teacher_is_qwen and not student_is_llama:
-            # Qwen (student) -> Qwen (teacher): same family, no mapping needed
+        elif student_family == "qwen" and teacher_family == "qwen":
+            # Qwen (student) -> Qwen (teacher): same chat template format,
+            # no string replacement needed. Re-tokenization handles vocab differences.
             return []
         else:
             raise NotImplementedError(
                 f"Unsupported cross-tokenizer pair: student has "
-                f"{'LLaMA' if student_is_llama else 'unknown'} vocab, "
-                f"teacher has {'Qwen' if teacher_is_qwen else 'unknown'} vocab. "
+                f"'{student_family}' vocab, "
+                f"teacher has '{teacher_family}' vocab. "
                 f"Please add a mapping in _build_chat_template_mapping()."
             )
 
@@ -201,12 +218,23 @@ class TeacherClient:
             # a trailing \n after the last turn. Only strip it if the original student
             # text ended with an eos/eot special token (meaning the \n came from mapping,
             # not from the actual content). If truncated (no eos), don't strip.
-            student_has_eos = any(
-                student_text.endswith(tok)
-                for tok in ["<|eot_id|>", "<|end_of_text|>"]
-            )
-            if student_has_eos:
-                teacher_text = teacher_text.rstrip('\n')
+            # NOTE: For Qwen->Qwen cross-tokenizer (empty mapping), the text is unchanged
+            # so this stripping is harmless (student_has_eos will be False for LLaMA tokens).
+            student_family = self._detect_model_family(self.student_tokenizer)
+            if student_family == "llama":
+                student_has_eos = any(
+                    student_text.endswith(tok)
+                    for tok in ["<|eot_id|>", "<|end_of_text|>"]
+                )
+                if student_has_eos:
+                    teacher_text = teacher_text.rstrip('\n')
+            elif student_family == "qwen":
+                # Qwen->Qwen: no template conversion, no trailing \n issue.
+                # But we should strip trailing \n that Qwen's <|im_end|>\n adds
+                # if the teacher tokenizer would not expect it at the end.
+                # Actually, since both use the same chat format and we're just
+                # re-encoding the same text, no stripping is needed.
+                pass
 
             new_input_id = self.tokenizer(teacher_text, add_special_tokens=False)['input_ids']
             if self.max_seq_len and len(new_input_id) > self.max_seq_len:
@@ -706,10 +734,21 @@ class TeacherClient:
             teacher_tokenizer = self.tokenizer
             student_tokenizer = self.student_tokenizer
 
+            # Detect model families for response boundary markers
+            student_family = self._detect_model_family(student_tokenizer)
+            teacher_family = self._detect_model_family(teacher_tokenizer)
+
             # Precompute the response-start markers (as text) for locating response boundaries
-            # Student (LLaMA): ...assistant<|end_header_id|>\n\n
-            # Teacher (Qwen):  ...assistant\n
-            student_resp_marker = "<|end_header_id|>\n\n"
+            if student_family == "llama":
+                # LLaMA: ...assistant<|end_header_id|>\n\n{response}
+                student_resp_marker = "<|end_header_id|>\n\n"
+            elif student_family == "qwen":
+                # Qwen: ...<|im_start|>assistant\n{response}
+                student_resp_marker = "<|im_start|>assistant\n"
+            else:
+                raise NotImplementedError(f"Unsupported student model family: {student_family}")
+
+            # Teacher is always Qwen in current supported configurations
             teacher_resp_marker = "<|im_start|>assistant\n"
 
             for i in range(batch_size):
@@ -738,15 +777,22 @@ class TeacherClient:
                         break
 
                 # Find the token index where the response content ends in student
-                # (exclude trailing special tokens: <|eot_id|> or <|end_of_text|> for LLaMA)
+                # (exclude trailing special tokens)
                 student_resp_end_tok = len(student_ids)
                 student_special_end_ids = set()
                 if student_tokenizer.eos_token_id is not None:
                     student_special_end_ids.add(student_tokenizer.eos_token_id)
-                # LLaMA 3.x uses <|eot_id|> (128009) as end-of-turn, distinct from eos
-                eot_id = student_tokenizer.convert_tokens_to_ids("<|eot_id|>")
-                if isinstance(eot_id, int) and eot_id != student_tokenizer.unk_token_id:
-                    student_special_end_ids.add(eot_id)
+                if student_family == "llama":
+                    # LLaMA 3.x uses <|eot_id|> (128009) as end-of-turn, distinct from eos
+                    eot_id = student_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                    if isinstance(eot_id, int) and eot_id != student_tokenizer.unk_token_id:
+                        student_special_end_ids.add(eot_id)
+                elif student_family == "qwen":
+                    # Qwen uses <|im_end|> as end-of-turn and <|endoftext|> as eos
+                    for special_tok in ["<|im_end|>", "<|endoftext|>"]:
+                        tok_id = student_tokenizer.convert_tokens_to_ids(special_tok)
+                        if isinstance(tok_id, int) and tok_id != student_tokenizer.unk_token_id:
+                            student_special_end_ids.add(tok_id)
                 while student_resp_end_tok > student_resp_start_tok and student_ids[student_resp_end_tok - 1] in student_special_end_ids:
                     student_resp_end_tok -= 1
 

@@ -476,6 +476,11 @@ if __name__ == "__main__":
         "TEACHER_N_WORKERS",
         "TEACHER_CKPT_PATH",
         "TEACHER_MAX_SEQ_LEN",
+        # OPD: alignment dump configuration
+        "OPD_DUMP_DIR",
+        "OPD_DUMP_NUM_SEQS",
+        "OPD_DUMP_MAX_STEPS",
+        "OPD_LARGE_CHUNK_THRESHOLD",
         # OPD: re-anchoring on fallback (kept for bench toggling); if set to
         # wandb: project / entity / api key / mode forwarded so Ray-spawned
         # workers can initialise the run even though they don't inherit the
@@ -497,6 +502,13 @@ if __name__ == "__main__":
     for k, v in _teacher_env_defaults.items():
         os.environ.setdefault(k, v)
     _forward_env = {k: os.environ[k] for k in _teacher_env_keys if os.environ.get(k, "") != ""}
+
+    # Also forward NCCL / IB / network env vars so Ray workers on remote nodes
+    # get the same InfiniBand and debug configuration as the driver process.
+    _NCCL_PREFIXES = ("NCCL_", "UCX_", "GLOO_", "NVSHMEM_")
+    for key, value in os.environ.items():
+        if any(key.startswith(p) for p in _NCCL_PREFIXES):
+            _forward_env[key] = value
 
     if not ray.is_initialized():
         ray.init(address="auto", runtime_env={"env_vars": _forward_env})

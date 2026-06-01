@@ -15,10 +15,28 @@
 import importlib
 import logging
 import os
+import resource
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as get_version
 
 from packaging.version import parse as parse_version
+
+# ---------------------------------------------------------------------------
+# Raise the locked-memory (memlock) limit as early as possible.
+#
+# NCCL's IB transport calls ibv_reg_mr to pin GPU/host memory for RDMA.
+# In container environments the default memlock can be as low as 64 KB,
+# which causes "ibv_reg_mr_iova2 failed with error Invalid argument".
+# Setting this at import time – before torch, NCCL, or any IB library
+# is loaded – ensures every process (driver + Ray workers) benefits.
+# ---------------------------------------------------------------------------
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if _soft != resource.RLIM_INFINITY:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK,
+                           (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+except (ValueError, OSError):
+    pass  # best-effort; will fail if container lacks CAP_IPC_LOCK
 
 from .protocol import DataProto
 from .utils.device import is_npu_available

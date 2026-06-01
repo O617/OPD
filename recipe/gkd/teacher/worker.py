@@ -29,8 +29,11 @@ def main():
     parser.add_argument("--n-logprobs", type=int, default=256)
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--pp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
+    parser.add_argument("--distributed-executor-backend", type=str, default=None,
+                        help="Distributed executor backend (e.g. 'ray').")
     # vLLM engine knobs (forwarded to vllm_engine.VLLMEngine)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5,
                         help="Fraction of GPU memory vLLM can use.")
@@ -38,18 +41,32 @@ def main():
                         help="vLLM max_num_batched_tokens.")
     parser.add_argument("--max-model-len", type=int, default=30720,
                         help="vLLM max_model_len (prompt+generation).")
+    # vLLM HTTP engine options (backend=vllm_http)
+    parser.add_argument("--vllm-server-url", type=str, default="http://localhost:8000",
+                        help="URL of the vLLM OpenAI-compatible server (for vllm_http backend).")
     args = parser.parse_args()
 
     if args.backend == "vllm":
-        from vllm_engine import VLLMEngine
+        from vllm_engine_v019 import VLLMEngine
 
         engine = VLLMEngine(
             args.ckpt_path,
             args.n_logprobs,
             args.tp_size,
+            pp_size=args.pp_size,
+            ep_size=args.ep_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_model_len=args.max_model_len,
+            distributed_executor_backend=args.distributed_executor_backend,
+        )
+    elif args.backend == "vllm_http":
+        from vllm_http_engine import VLLMHTTPEngine
+
+        engine = VLLMHTTPEngine(
+            server_url=args.vllm_server_url,
+            model_name=args.ckpt_path,
+            n_logprobs=args.n_logprobs,
         )
     else:
         raise ValueError(f"Unknown backend: {args.backend}.")

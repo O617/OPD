@@ -2,8 +2,7 @@ export PROXY_FRONTEND_PORT=15555
 export PROXY_BACKEND_PORT=15556
 
 BACKEND=vllm
-CKPT_PATH="/data/main/hanxiao/Qwen3-32B"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+CKPT_PATH="<private-cephfs-path>"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 wait_server_ready() {
@@ -30,7 +29,7 @@ wait_server_ready proxy localhost $PROXY_BACKEND_PORT
 
 echo "teacher proxy is ready"
 
-nohup python worker.py --backend $BACKEND --tp-size 4 --n-logprobs 1 --ckpt-path $CKPT_PATH &> worker.log &
+nohup python worker.py --backend $BACKEND --tp-size 8 --n-logprobs 1 --ckpt-path $CKPT_PATH &> worker.log &
 echo "start teacher worker"
 
 echo "teacher server is ready"

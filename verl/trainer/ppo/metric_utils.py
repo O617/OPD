@@ -101,14 +101,25 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
     """
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    token_level_scores = batch.batch["token_level_scores"]
+    token_level_rewards = batch.batch["token_level_rewards"]
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
     max_response_length = batch.batch["responses"].shape[-1]
 
+    # When OPD reward manager concatenates [teacher_logps | chunk_ids] along dim=-1,
+    # the tensor width is doubled. Strip the chunk_ids half before computing metrics.
+    if token_level_scores.shape[-1] % 2 == 0 and token_level_scores.shape[-1] // 2 >= max_response_length:
+        token_level_scores = token_level_scores[:, : token_level_scores.shape[-1] // 2]
+    if token_level_rewards.shape[-1] % 2 == 0 and token_level_rewards.shape[-1] // 2 >= max_response_length:
+        token_level_rewards = token_level_rewards[:, : token_level_rewards.shape[-1] // 2]
+
+    sequence_score = token_level_scores.sum(-1)
+    sequence_reward = token_level_rewards.sum(-1)
+
+    # Per-sample mean of token-level scores (average logp per token)
     prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
     response_mask = batch.batch["response_mask"].bool()
 
@@ -124,6 +135,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     non_aborted_sequence_score = sequence_score[non_aborted_mask]
     non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
 
+    # Compute per-sample mean token-level score (mean logp per token per sample)
+    # Use response_mask to only average over valid response tokens
+    response_token_counts = response_mask.sum(-1).float().clamp(min=1)  # avoid div by 0
+    token_scores_masked = token_level_scores[:, -response_mask.shape[-1]:] * response_mask
+    per_sample_mean_score = token_scores_masked.sum(-1) / response_token_counts
+    non_aborted_per_sample_mean_score = per_sample_mean_score[non_aborted_mask]
+
+    mean_score_mean = torch.mean(non_aborted_per_sample_mean_score).detach().item()
+    mean_score_max = torch.max(non_aborted_per_sample_mean_score).detach().item()
+    mean_score_min = torch.min(non_aborted_per_sample_mean_score).detach().item()
+
     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
     score_max = torch.max(non_aborted_sequence_score).detach().item()
     score_min = torch.min(non_aborted_sequence_score).detach().item()
@@ -133,9 +155,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     reward_min = torch.min(non_aborted_sequence_reward).detach().item()
     # breakpoint()
     if advantages.shape[-1] > response_mask.shape[-1]:
-        advantages = advantages[:, -response_mask.shape[-1] -1: -1]
+        if advantages.shape[-1] % 2 == 0 and advantages.shape[-1] // 2 >= response_mask.shape[-1]:
+            advantages = advantages[:, : advantages.shape[-1] // 2]
+        advantages = advantages[:, -response_mask.shape[-1]:]
     if returns.shape[-1] > response_mask.shape[-1]:
-        returns = returns[:, -response_mask.shape[-1] -1: -1]
+        if returns.shape[-1] % 2 == 0 and returns.shape[-1] // 2 >= response_mask.shape[-1]:
+            returns = returns[:, : returns.shape[-1] // 2]
+        returns = returns[:, -response_mask.shape[-1]:]
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
@@ -169,6 +195,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        # per-sample mean score (average logp per token, then stats across batch)
+        "critic/mean_token_score/mean": mean_score_mean,
+        "critic/mean_token_score/max": mean_score_max,
+        "critic/mean_token_score/min": mean_score_min,
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),

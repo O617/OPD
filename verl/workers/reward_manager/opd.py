@@ -24,6 +24,7 @@ import torch
 import zmq
 import io
 import os
+import json
 import time
 import queue
 import threading
@@ -38,8 +39,34 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from transformers import AutoTokenizer
 
-teacher_topk_logps_padded, teacher_topk_indices_padded = None, None
+teacher_topk_logps_padded, teacher_topk_indices_padded, teacher_chunk_ids_padded = None, None, None
 DEBUG = False
+
+# ---- Alignment dump configuration (controlled by environment variables) ----
+# OPD_DUMP_DIR: directory to write alignment debug dumps (disabled if unset/empty)
+# OPD_DUMP_NUM_SEQS: number of sequences to dump per step (default: 2)
+# OPD_DUMP_MAX_STEPS: stop dumping after this many steps (default: 50)
+OPD_DUMP_DIR = os.environ.get("OPD_DUMP_DIR", "")
+OPD_DUMP_NUM_SEQS = int(os.environ.get("OPD_DUMP_NUM_SEQS", "2"))
+OPD_DUMP_MAX_STEPS = int(os.environ.get("OPD_DUMP_MAX_STEPS", "50"))
+_dump_step_counter = 0
+
+
+def _dump_alignment(step, seq_idx, dump_data):
+    """Write alignment debug info to a JSON file.
+
+    Args:
+        step: global step counter
+        seq_idx: sequence index within the batch
+        dump_data: dict containing alignment details
+    """
+    if not OPD_DUMP_DIR:
+        return
+    os.makedirs(OPD_DUMP_DIR, exist_ok=True)
+    filepath = os.path.join(OPD_DUMP_DIR, f"step_{step:04d}_seq_{seq_idx:03d}.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(dump_data, f, ensure_ascii=False, indent=2)
+
 
 def chunk_list(lst, n_chunks):
     """Split a list into chunks of equal length"""
@@ -130,7 +157,7 @@ class TeacherClient:
         """Detect the model family of a tokenizer based on its vocabulary. Result is cached.
 
         Returns:
-            str: One of "llama", "qwen", or "unknown".
+            str: One of "llama", "qwen", "deepseek", or "unknown".
         """
         if not hasattr(self, '_family_cache'):
             self._family_cache = {}
@@ -141,6 +168,10 @@ class TeacherClient:
                 self._family_cache[tok_id] = "llama"
             elif "<|im_start|>" in vocab:
                 self._family_cache[tok_id] = "qwen"
+            elif "<｜begin▁of▁sentence｜>" in vocab:
+                # DeepSeek family: uses fullwidth markers like <｜begin▁of▁sentence｜>,
+                # <｜User｜>, <｜Assistant｜>, <｜end▁of▁sentence｜>
+                self._family_cache[tok_id] = "deepseek"
             else:
                 self._family_cache[tok_id] = "unknown"
         return self._family_cache[tok_id]
@@ -150,7 +181,10 @@ class TeacherClient:
 
         Currently supports:
             - LLaMA 3.x (student) -> Qwen (teacher)
+            - LLaMA 3.x (student) -> DeepSeek (teacher)
+            - Qwen (student) -> DeepSeek (teacher)
             - Qwen (student) -> Qwen (teacher) [same chat template, no mapping needed]
+            - DeepSeek (student) -> DeepSeek (teacher) [same chat template, no mapping needed]
 
         The mapping is a list of (old_str, new_str) tuples applied in order via str.replace().
         """
@@ -171,9 +205,50 @@ class TeacherClient:
                 ("<|begin_of_text|>", ""),
                 ("<|end_of_text|>", "<|im_end|>\n"),
             ]
+        elif student_family == "llama" and teacher_family == "deepseek":
+            # LLaMA 3.x (student) -> DeepSeek (teacher)
+            # LLaMA format:  <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+            # DeepSeek format: <｜begin▁of▁sentence｜><｜User｜>{content}<｜Assistant｜>{response}<｜end▁of▁sentence｜>
+            # With system:     <｜begin▁of▁sentence｜>{system}<｜User｜>{content}<｜Assistant｜>{response}<｜end▁of▁sentence｜>
+            return [
+                # Handle system role first (longest compound patterns first)
+                ("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n", "<｜begin▁of▁sentence｜>"),
+                # Handle user role
+                ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n", "<｜begin▁of▁sentence｜><｜User｜>"),
+                ("<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n", "<｜User｜>"),
+                # Handle assistant role
+                ("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", "<｜Assistant｜>"),
+                # Handle end tokens
+                ("<|eot_id|>", "<｜end▁of▁sentence｜>"),
+                ("<|begin_of_text|>", "<｜begin▁of▁sentence｜>"),
+                ("<|end_of_text|>", "<｜end▁of▁sentence｜>"),
+            ]
+        elif student_family == "qwen" and teacher_family == "deepseek":
+            # Qwen (student) -> DeepSeek (teacher)
+            # Qwen format:    <|im_start|>{role}\n{content}<|im_end|>\n
+            # DeepSeek format: <｜begin▁of▁sentence｜><｜User｜>{content}<｜Assistant｜>{response}<｜end▁of▁sentence｜>
+            # With system:     <｜begin▁of▁sentence｜>{system}<｜User｜>{content}<｜Assistant｜>{response}<｜end▁of▁sentence｜>
+            return [
+                # Handle system role (if present)
+                ("<|im_start|>system\n", "<｜begin▁of▁sentence｜>"),
+                # Handle user role (compound patterns first)
+                ("<|im_end|>\n<|im_start|>user\n", "<｜User｜>"),
+                ("<|im_start|>user\n", "<｜begin▁of▁sentence｜><｜User｜>"),
+                # Handle assistant role (compound pattern first)
+                ("<|im_end|>\n<|im_start|>assistant\n", "<｜Assistant｜>"),
+                # Handle remaining end tokens (with trailing newline first)
+                ("<|im_end|>\n", "<｜end▁of▁sentence｜>"),
+                ("<|im_end|>", "<｜end▁of▁sentence｜>"),
+                ("<|endoftext|>", "<｜end▁of▁sentence｜>"),
+            ]
         elif student_family == "qwen" and teacher_family == "qwen":
             # Qwen (student) -> Qwen (teacher): same chat template format,
             # no string replacement needed. Re-tokenization handles vocab differences.
+            return []
+        elif student_family == "deepseek" and teacher_family == "deepseek":
+            # DeepSeek (student) -> DeepSeek (teacher): same chat template format
+            # (both use <｜User｜>, <｜Assistant｜>, <｜end▁of▁sentence｜>).
+            # No string replacement needed. Re-tokenization handles vocab differences.
             return []
         else:
             raise NotImplementedError(
@@ -214,12 +289,14 @@ class TeacherClient:
                 # print(f"[DEBUG retokenize] student_text:\n{student_text}")
                 # print(f"[DEBUG retokenize] teacher_text:\n{teacher_text}")
                 pass
-            # The template mapping converts <|eot_id|> -> <|im_end|>\n, which leaves
-            # a trailing \n after the last turn. Only strip it if the original student
-            # text ended with an eos/eot special token (meaning the \n came from mapping,
-            # not from the actual content). If truncated (no eos), don't strip.
-            # NOTE: For Qwen->Qwen cross-tokenizer (empty mapping), the text is unchanged
-            # so this stripping is harmless (student_has_eos will be False for LLaMA tokens).
+            # Strip trailing \n that may arise from template mapping:
+            # - LLaMA->Qwen: <|eot_id|> -> <|im_end|>\n leaves a trailing \n
+            # - LLaMA->DeepSeek: <|eot_id|> -> <｜end▁of▁sentence｜> (no trailing \n, rstrip harmless)
+            # Only strip if the original student text ended with an eos/eot special token
+            # (meaning the \n came from mapping, not from the actual content).
+            # NOTE: For Qwen->DeepSeek, the mapping handles <|im_end|>\n -> <｜end▁of▁sentence｜>
+            # atomically, so no trailing \n remains. For same-template pairs (Qwen->Qwen,
+            # DeepSeek->DeepSeek), text is unchanged so no stripping is needed.
             student_family = self._detect_model_family(self.student_tokenizer)
             if student_family == "llama":
                 student_has_eos = any(
@@ -229,11 +306,12 @@ class TeacherClient:
                 if student_has_eos:
                     teacher_text = teacher_text.rstrip('\n')
             elif student_family == "qwen":
-                # Qwen->Qwen: no template conversion, no trailing \n issue.
-                # But we should strip trailing \n that Qwen's <|im_end|>\n adds
-                # if the teacher tokenizer would not expect it at the end.
-                # Actually, since both use the same chat format and we're just
-                # re-encoding the same text, no stripping is needed.
+                # Qwen->Qwen: no mapping, text unchanged, no trailing \n issue.
+                # Qwen->DeepSeek: <|im_end|>\n -> <｜end▁of▁sentence｜> already clean.
+                pass
+            elif student_family == "deepseek":
+                # DeepSeek->DeepSeek: same chat template format, no conversion,
+                # no trailing \n issue. Text is passed through unchanged.
                 pass
 
             new_input_id = self.tokenizer(teacher_text, add_special_tokens=False)['input_ids']
@@ -276,20 +354,22 @@ class TeacherClient:
                 consecutive replacement characters). Default=6.
 
         Returns:
-            (aligned, chunk_details, teacher_truncated) where:
+            (aligned, chunk_ids, chunk_details, teacher_truncated) where:
                 aligned: Tensor [len(student_ids)], aligned logprobs for each student token
+                chunk_ids: Tensor [len(student_ids)], same ID for student tokens in a synchronized chunk
                 chunk_details: list of dicts with per-chunk info (only populated when debug=True)
                 teacher_truncated: bool, True if teacher ran out before student
         """
         n_stu = len(student_ids)
         n_tec = len(teacher_ids)
         aligned = torch.zeros(n_stu, dtype=teacher_logps.dtype)
+        chunk_ids = torch.full((n_stu,), -1, dtype=torch.float32)
 
         chunk_details = []  # per-chunk info for debug
         teacher_truncated = False  # True iff teacher tokens ran out while student still had content
 
         if n_stu == 0 or n_tec == 0:
-            return aligned, chunk_details, teacher_truncated
+            return aligned, chunk_ids, chunk_details, teacher_truncated
 
         s_ptr = 0  # next student token to consume
         t_ptr = 0  # next teacher token to consume
@@ -323,6 +403,7 @@ class TeacherClient:
                         aligned[s_ptr:s_end] = float('inf')
                     else:
                         aligned[s_ptr:s_end] = chunk_logp / n_stu_tokens
+                        chunk_ids[s_ptr:s_end] = _chunk_count
                     # if debug and not (n_stu_tokens == 1 and (t_end - t_ptr) == 1):
                     #     s_repr = repr(s_text)
                     #     print(f"  [multi-chunk {_chunk_count}] stu[{s_ptr}:{s_end}]({n_stu_tokens}t) <-> tec[{t_ptr}:{t_end}]({t_end-t_ptr}t)  "
@@ -528,12 +609,12 @@ class TeacherClient:
                         for ti, tid, tlogp, ttxt in tec_toks:
                             print(f"      tec[{ti}] id={tid:>6d}  logp={tlogp:.4f}  {repr(ttxt)}")
 
-        return aligned, chunk_details, teacher_truncated
+        return aligned, chunk_ids, chunk_details, teacher_truncated
     def bg_task(self):
         socket = self.context.socket(zmq.REQ)
         socket.connect(f"tcp://{self.server_ip}:{self.server_port}")
         socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, 600000)  # 接收超时 30 分钟
+        socket.setsockopt(zmq.RCVTIMEO, 1800000)  # 接收超时 30 分钟
 
         while True:
             futures = []
@@ -660,15 +741,32 @@ class TeacherClient:
             futures.append(fut)
 
         def handle_futures():
-            for future in futures:
+            MAX_RETRIES = 3
+            retry_count = 0
+            while retry_count <= MAX_RETRIES:
                 try:
-                    response, teacher_topk_logps, teacher_topk_indices = future.result()
+                    for future in futures:
+                        response, teacher_topk_logps, teacher_topk_indices = future.result()
+                        all_teacher_topk_logps.extend(teacher_topk_logps)
+                        all_teacher_topk_indices.extend(teacher_topk_indices)
+                        responses.extend(response)
+                    break  # success
                 except Exception as e:
-                    raise RuntimeError(f"Teacher request failed: {e}") from e
-
-                all_teacher_topk_logps.extend(teacher_topk_logps)
-                all_teacher_topk_indices.extend(teacher_topk_indices)
-                responses.extend(response)
+                    retry_count += 1
+                    if retry_count > MAX_RETRIES:
+                        raise RuntimeError(f"Teacher request failed after {MAX_RETRIES} retries: {e}") from e
+                    print(f"[WARNING] Teacher request failed (attempt {retry_count}/{MAX_RETRIES}): {e}. Retrying...")
+                    import time as _time
+                    _time.sleep(5)
+                    # Clear and resubmit
+                    all_teacher_topk_logps.clear()
+                    all_teacher_topk_indices.clear()
+                    responses.clear()
+                    futures.clear()
+                    for i in range(0, batch_size, micro_batch_size):
+                        fut = self.submit(input_ids[i : i + micro_batch_size])
+                        fut.add_done_callback(cb)
+                        futures.append(fut)
 
             tik2 = time.time()
             # teacher_topk_logps = [x.to(params_dtype) for x in all_teacher_topk_logps]
@@ -684,7 +782,7 @@ class TeacherClient:
             # teacher_knowledge_shape = list(batch.batch["input_ids"].shape) + [topk]
             teacher_knowledge_shape = list(batch.batch["input_ids"].shape)
 
-            global teacher_topk_logps_padded, teacher_topk_indices_padded
+            global teacher_topk_logps_padded, teacher_topk_indices_padded, teacher_chunk_ids_padded
             if (
                 teacher_topk_logps_padded is None
                 or teacher_topk_logps_padded.dtype != logp_dtype
@@ -703,7 +801,25 @@ class TeacherClient:
             else:
                 teacher_topk_indices_padded.zero_()
 
+            if (
+                teacher_chunk_ids_padded is None
+                or teacher_chunk_ids_padded.shape != torch.Size(teacher_knowledge_shape)
+            ):
+                teacher_chunk_ids_padded = torch.full(teacher_knowledge_shape, -1.0, dtype=torch.float32)
+            else:
+                teacher_chunk_ids_padded.fill_(-1.0)
+
             batch_size = attention_mask.size(0)
+
+            # ---- Dump control ----
+            global _dump_step_counter
+            should_dump = bool(OPD_DUMP_DIR) and _dump_step_counter < OPD_DUMP_MAX_STEPS
+            if should_dump:
+                current_dump_step = _dump_step_counter
+                _dump_step_counter += 1
+                dump_num = min(OPD_DUMP_NUM_SEQS, batch_size)
+            else:
+                dump_num = 0
 
             if self._is_same_tokenizer():
                 # Same tokenizer: direct fill, no alignment needed.
@@ -718,7 +834,33 @@ class TeacherClient:
                     # logps[N-1] predicts token N (doesn't exist / last+1), skip it
                     n_fill = min(len(logps) - 1, len(valid_pos) - 1)
                     teacher_topk_logps_padded[i, valid_pos[1:1+n_fill]] = logps[:n_fill]
-                return teacher_topk_logps_padded
+                    teacher_chunk_ids_padded[i, valid_pos[1:1+n_fill]] = torch.arange(
+                        n_fill, dtype=torch.float32
+                    )
+
+                    # Dump for same-tokenizer case
+                    if i < dump_num:
+                        student_tokenizer = self.student_tokenizer
+                        stu_ids = input_ids[i]
+                        tch_ids = responses[i].tolist()
+                        _dump_alignment(current_dump_step, i, {
+                            "mode": "same_tokenizer",
+                            "student_family": self._detect_model_family(student_tokenizer),
+                            "teacher_family": self._detect_model_family(self.tokenizer),
+                            "student_text": student_tokenizer.decode(stu_ids, skip_special_tokens=False),
+                            "teacher_text": self.tokenizer.decode(tch_ids, skip_special_tokens=False),
+                            "student_token_count": len(stu_ids),
+                            "teacher_token_count": len(tch_ids),
+                            "student_tokens": [
+                                {"id": tid, "text": student_tokenizer.decode([tid], skip_special_tokens=False)}
+                                for tid in stu_ids[:100]  # first 100 for brevity
+                            ],
+                            "teacher_logps_sample": logps[:50].tolist(),
+                        })
+                return torch.cat(
+                    [teacher_topk_logps_padded, teacher_chunk_ids_padded.to(teacher_topk_logps_padded.dtype)],
+                    dim=-1,
+                )
 
             # ============================================================
             # Cross-tokenizer alignment: align teacher logprobs to student
@@ -745,11 +887,19 @@ class TeacherClient:
             elif student_family == "qwen":
                 # Qwen: ...<|im_start|>assistant\n{response}
                 student_resp_marker = "<|im_start|>assistant\n"
+            elif student_family == "deepseek":
+                # DeepSeek: ...<｜Assistant｜>{response}
+                student_resp_marker = "<｜Assistant｜>"
             else:
                 raise NotImplementedError(f"Unsupported student model family: {student_family}")
 
-            # Teacher is always Qwen in current supported configurations
-            teacher_resp_marker = "<|im_start|>assistant\n"
+            # Teacher response marker depends on teacher family
+            if teacher_family == "qwen":
+                teacher_resp_marker = "<|im_start|>assistant\n"
+            elif teacher_family == "deepseek":
+                teacher_resp_marker = "<｜Assistant｜>"
+            else:
+                raise NotImplementedError(f"Unsupported teacher model family: {teacher_family}")
 
             for i in range(batch_size):
                 student_ids = input_ids[i]  # list[int], student prompt+response
@@ -793,6 +943,9 @@ class TeacherClient:
                         tok_id = student_tokenizer.convert_tokens_to_ids(special_tok)
                         if isinstance(tok_id, int) and tok_id != student_tokenizer.unk_token_id:
                             student_special_end_ids.add(tok_id)
+                elif student_family == "deepseek":
+                    # DeepSeek uses <｜end▁of▁sentence｜> as eos (already added above via eos_token_id)
+                    pass
                 while student_resp_end_tok > student_resp_start_tok and student_ids[student_resp_end_tok - 1] in student_special_end_ids:
                     student_resp_end_tok -= 1
 
@@ -817,15 +970,19 @@ class TeacherClient:
                         teacher_resp_start_tok = tok_idx + 1
                         break
 
-                # Teacher response ends before trailing special tokens (<|im_end|> or <|endoftext|> for Qwen)
+                # Teacher response ends before trailing special tokens
                 teacher_special_end_ids = set()
                 if teacher_tokenizer.eos_token_id is not None:
                     teacher_special_end_ids.add(teacher_tokenizer.eos_token_id)
-                # Qwen uses <|im_end|> as end-of-turn and <|endoftext|> as eos; both should be stripped
-                for special_tok in ["<|im_end|>", "<|endoftext|>"]:
-                    tok_id = teacher_tokenizer.convert_tokens_to_ids(special_tok)
-                    if isinstance(tok_id, int) and tok_id != teacher_tokenizer.unk_token_id:
-                        teacher_special_end_ids.add(tok_id)
+                if teacher_family == "qwen":
+                    # Qwen uses <|im_end|> as end-of-turn and <|endoftext|> as eos; both should be stripped
+                    for special_tok in ["<|im_end|>", "<|endoftext|>"]:
+                        tok_id = teacher_tokenizer.convert_tokens_to_ids(special_tok)
+                        if isinstance(tok_id, int) and tok_id != teacher_tokenizer.unk_token_id:
+                            teacher_special_end_ids.add(tok_id)
+                elif teacher_family == "deepseek":
+                    # DeepSeek uses <｜end▁of▁sentence｜> as eos (already added above via eos_token_id)
+                    pass
                 teacher_resp_end_tok = len(teacher_ids_no_gen)
                 while teacher_resp_end_tok > teacher_resp_start_tok and teacher_ids_no_gen[teacher_resp_end_tok - 1] in teacher_special_end_ids:
                     teacher_resp_end_tok -= 1
@@ -843,44 +1000,65 @@ class TeacherClient:
                 teacher_resp_logps = teacher_logps[teacher_resp_start_tok - 1 : teacher_resp_end_tok - 1]
 
                 # --- Step B: Chunk-level greedy alignment on response text ---
-                # print(f"[align seq {i}] stu_resp={len(student_resp_ids)}t, tec_resp={len(teacher_resp_ids)}t, "
-                #       f"stu_resp_head10={student_resp_ids[:10]}")
-                aligned_logps, seq_chunk_details, teacher_truncated = self._align_chunks(
+                _do_dump_this_seq = (i < dump_num)
+                aligned_logps, aligned_chunk_ids, seq_chunk_details, teacher_truncated = self._align_chunks(
                     student_resp_ids, teacher_resp_ids, teacher_resp_logps,
-                    student_tokenizer, teacher_tokenizer, debug=False,
+                    student_tokenizer, teacher_tokenizer, debug=_do_dump_this_seq,
                     large_chunk_threshold=self.large_chunk_threshold
                 )
-                # # DEBUG: print seq 0 chunk alignment detail (teacher side)
-                # if i == 0 and seq_chunk_details:
-                #     print("\n" + "=" * 80)
-                #     print(f"[OPD ALIGN] seq 0: chunk alignment detail "
-                #           f"(stu_resp={len(student_resp_ids)}t, tec_resp={len(teacher_resp_ids)}t)")
-                #     print("=" * 80)
-                #     for chunk in seq_chunk_details:
-                #         cid = chunk["chunk_id"]
-                #         s_s, s_e = chunk["s_start"], chunk["s_end"]
-                #         n_s, n_t = chunk["n_stu"], chunk["n_tec"]
-                #         ctype = chunk["type"]
-                #         text_repr = repr(chunk["text"])[:120]
-                #         tch_sum = chunk["teacher_logp_sum"]
-                #         tch_avg = chunk["aligned_avg"]
-                #         print(f"\n  chunk {cid:>3d} [{ctype:>8s}] text={text_repr}")
-                #         print(f"    stu[{s_s}:{s_e}]({n_s}t) <-> tec({n_t}t)  "
-                #               f"tch_logp_sum={tch_sum:>8.4f}  avg_per_stu={tch_avg:>8.4f}")
-                #         # Teacher tokens with logp
-                #         tch_tokens = chunk.get("teacher_tokens", [])
-                #         for ti_idx, (tid, tlogp, ttxt) in enumerate(tch_tokens):
-                #             print(f"      tec[{ti_idx}] id={tid:>6d}  logp={tlogp:>8.4f}  {repr(ttxt)}")
-                #         if n_t > len(tch_tokens):
-                #             print(f"      ... ({n_t - len(tch_tokens)} more teacher tokens)")
-                #         # Student tokens
-                #         stu_tokens = chunk.get("student_tokens", [])
-                #         for si_idx, (sid, stxt) in enumerate(stu_tokens):
-                #             print(f"      stu[{si_idx}] id={sid:>6d}                    {repr(stxt)}")
-                #         if n_s > len(stu_tokens):
-                #             print(f"      ... ({n_s - len(stu_tokens)} more student tokens)")
-                #     print("=" * 80 + "\n")
-                # aligned_logps: shape [len(student_resp_ids)]
+
+                # --- Dump alignment details ---
+                if _do_dump_this_seq:
+                    _dump_alignment(current_dump_step, i, {
+                        "mode": "cross_tokenizer",
+                        "student_family": student_family,
+                        "teacher_family": teacher_family,
+                        "is_same_tokenizer": False,
+                        "template_mapping": getattr(self, '_template_mapping', None),
+                        "teacher_truncated": teacher_truncated,
+                        # Full text with chat template
+                        "student_full_text": student_full_text,
+                        "teacher_full_text": teacher_full_text,
+                        # Response boundaries
+                        "student_resp_start_tok": student_resp_start_tok,
+                        "student_resp_end_tok": student_resp_end_tok,
+                        "teacher_resp_start_tok": teacher_resp_start_tok,
+                        "teacher_resp_end_tok": teacher_resp_end_tok,
+                        # Response text
+                        "student_resp_text": student_tokenizer.decode(student_resp_ids, skip_special_tokens=False),
+                        "teacher_resp_text": teacher_tokenizer.decode(teacher_resp_ids, skip_special_tokens=False),
+                        # Token counts
+                        "student_resp_token_count": len(student_resp_ids),
+                        "teacher_resp_token_count": len(teacher_resp_ids),
+                        # Student response tokens (id + decoded text)
+                        "student_resp_tokens": [
+                            {"pos": idx, "id": int(tid), "text": student_tokenizer.decode([tid], skip_special_tokens=False)}
+                            for idx, tid in enumerate(student_resp_ids)
+                        ],
+                        # Teacher response tokens (id + decoded text + logprob)
+                        "teacher_resp_tokens": [
+                            {
+                                "pos": idx,
+                                "id": int(teacher_resp_ids[idx]),
+                                "text": teacher_tokenizer.decode([teacher_resp_ids[idx]], skip_special_tokens=False),
+                                "logprob": float(teacher_resp_logps[idx]) if idx < len(teacher_resp_logps) else None,
+                            }
+                            for idx in range(len(teacher_resp_ids))
+                        ],
+                        # Chunk alignment details
+                        "chunk_alignment": seq_chunk_details,
+                        # Final aligned logprobs for student tokens
+                        "aligned_logps": aligned_logps.tolist(),
+                        # Stats
+                        "stats": {
+                            "n_inf_positions": int((aligned_logps == float('inf')).sum()),
+                            "n_valid_positions": int((aligned_logps != float('inf')).sum()) - int((aligned_logps == 0).sum()),
+                            "n_zero_positions": int((aligned_logps == 0).sum()),
+                            "mean_valid_logp": float(aligned_logps[
+                                (aligned_logps != float('inf')) & (aligned_logps != 0)
+                            ].mean()) if ((aligned_logps != float('inf')) & (aligned_logps != 0)).any() else None,
+                        },
+                    })
 
                 # --- Step C: Check if teacher was truncated (overlong sequence) ---
                 # teacher_truncated=True means teacher tokens ran out before covering
@@ -890,6 +1068,7 @@ class TeacherClient:
                 # core_algos (torch.where), so we DON'T blow away the whole seq here.
                 if teacher_truncated:
                     teacher_topk_logps_padded[i, :] = float('inf')
+                    teacher_chunk_ids_padded[i, :] = -1.0
                     warnings.warn(
                         f"[align seq {i}] teacher truncated: skipping entire sequence "
                         f"(stu_resp={len(student_resp_ids)}t, tec_resp={len(teacher_resp_ids)}t)"
@@ -912,6 +1091,7 @@ class TeacherClient:
                 fill_start = student_resp_start_tok
                 fill_positions = valid_positions[fill_start:fill_start + len(aligned_logps)]
                 teacher_topk_logps_padded[i, fill_positions] = aligned_logps
+                teacher_chunk_ids_padded[i, fill_positions] = aligned_chunk_ids
 
                 # Fill special token positions.
                 # For non-truncated sequences: teacher has an eos logprob that tells the
@@ -935,13 +1115,20 @@ class TeacherClient:
                     # First special token gets teacher's eos logprob
                     first_special_pos = valid_positions[sentinel_start]
                     teacher_topk_logps_padded[i, first_special_pos] = teacher_eos_logp
+                    teacher_chunk_ids_padded[i, first_special_pos] = (
+                        aligned_chunk_ids.max().item() + 1 if len(aligned_chunk_ids) > 0 else 0
+                    )
 
                     # Remaining special tokens (if any) get inf sentinel
                     if n_special > 1:
                         remaining_positions = valid_positions[sentinel_start + 1:sentinel_end]
                         teacher_topk_logps_padded[i, remaining_positions] = float('inf')
+                        teacher_chunk_ids_padded[i, remaining_positions] = -1.0
 
-            return teacher_topk_logps_padded
+            return torch.cat(
+                [teacher_topk_logps_padded, teacher_chunk_ids_padded.to(teacher_topk_logps_padded.dtype)],
+                dim=-1,
+            )
 
         if is_async:
             return SimpleNamespace(get=handle_futures)
@@ -990,17 +1177,19 @@ class OPDRewardManager(AbstractRewardManager):
 
         # For Evaluation
         if is_validate:
+            import concurrent.futures
+
             reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
 
             already_print_data_sources = {}
 
+            # Pre-decode all samples
+            decoded_samples = []
             for i in range(len(data)):
                 data_item = data[i]  # DataProtoItem
 
                 prompt_ids = data_item.batch["prompts"]
-
                 prompt_length = prompt_ids.shape[-1]
-
                 valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
                 valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
@@ -1008,7 +1197,6 @@ class OPDRewardManager(AbstractRewardManager):
                 valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
                 valid_response_ids = response_ids[:valid_response_length]
 
-                # decode
                 prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
                 response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
@@ -1020,35 +1208,59 @@ class OPDRewardManager(AbstractRewardManager):
                 extra_info["num_turns"] = num_turns
                 extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-                score = default_compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
+                decoded_samples.append({
+                    "idx": i,
+                    "prompt_str": prompt_str,
+                    "response_str": response_str,
+                    "ground_truth": ground_truth,
+                    "data_source": data_source,
+                    "extra_info": extra_info,
+                    "valid_response_length": int(valid_response_length),
+                })
+
+            # Score all samples in parallel using ThreadPoolExecutor
+            # (subprocess-based scoring in livecodebench already isolates execution,
+            #  so threads are fine here — they just launch/wait on subprocesses)
+            NUM_EVAL_WORKERS = 16
+
+            def _score_one(sample):
+                return default_compute_score(
+                    data_source=sample["data_source"],
+                    solution_str=sample["response_str"],
+                    ground_truth=sample["ground_truth"],
+                    extra_info=sample["extra_info"],
                 )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_EVAL_WORKERS) as executor:
+                scores = list(executor.map(_score_one, decoded_samples))
+
+            # Collect results
+            for sample, score in zip(decoded_samples, scores):
+                i = sample["idx"]
+                valid_response_length = sample["valid_response_length"]
 
                 if isinstance(score, dict):
                     reward = score["score"]
-                    # Store the information including original reward
                     for key, value in score.items():
                         reward_extra_info[key].append(value)
                 else:
                     reward = score
-                    # Normalize to dict format for consistent reward_extra_info across data sources
                     reward_extra_info["score"].append(reward)
                     reward_extra_info["acc"].append(reward > 0)
                     reward_extra_info["pred"].append(None)
 
                 reward_tensor[i, valid_response_length - 1] = reward
 
+                data_source = sample["data_source"]
                 if data_source not in already_print_data_sources:
                     already_print_data_sources[data_source] = 0
 
                 if already_print_data_sources[data_source] < self.num_examine:
                     already_print_data_sources[data_source] += 1
-                    print("[prompt]", prompt_str)
-                    print("[response]", response_str)
-                    print("[ground_truth]", ground_truth)
+                    print("[prompt]", sample["prompt_str"][:500])
+                    print("[response]", sample["response_str"][:500])
+                    gt_str = str(sample["ground_truth"])
+                    print("[ground_truth]", gt_str[:200] + ("..." if len(gt_str) > 200 else ""))
                     if isinstance(score, dict):
                         for key, value in score.items():
                             print(f"[{key}]", value)

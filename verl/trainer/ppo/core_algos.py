@@ -1061,26 +1061,32 @@ def compute_policy_loss_opd(
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
     """
     
-    student_log_probs = log_prob.detach()
+    prior_log_probs = old_log_prob.detach()
     with torch.no_grad():
-        def compute_chunk_level_log_probs():
-            bsz, seqlen = teacher_log_probs.shape
-            for seq_id in range(bsz):
-                counter = 0
-                teacher_seq = teacher_log_probs[seq_id]
-                student_seq = student_log_probs[seq_id]
-                for token_idx in range(seqlen):
-                    if teacher_seq[token_idx] == teacher_seq[counter]:
-                        continue
-                    else:
-                        student_log_probs[seq_id, counter:token_idx] = torch.mean(student_seq[counter:token_idx])
-                        counter = token_idx
-
-        response_length = student_log_probs.shape[-1]
+        response_length = prior_log_probs.shape[-1]
         teacher_log_probs = advantages[..., -response_length:]
+        opd_chunk_ids = None
+        # Detect if chunk_ids are concatenated in the second half of the advantages tensor.
+        # The reward manager concatenates [teacher_logps_padded, chunk_ids_padded] along dim=-1.
+        if advantages.shape[-1] % 2 == 0:
+            split = advantages.shape[-1] // 2
+            possible_chunk_ids = advantages[..., split:]
+            finite_chunk_ids = possible_chunk_ids[torch.isfinite(possible_chunk_ids)]
+            has_chunk_id_half = (
+                split >= response_length
+                and finite_chunk_ids.numel() > 0
+                and bool(((finite_chunk_ids == -1) | (finite_chunk_ids >= 0)).all().item())
+                and bool(torch.allclose(finite_chunk_ids, finite_chunk_ids.round()))
+            )
+            if has_chunk_id_half:
+                teacher_log_probs = advantages[..., :split][..., -response_length:]
+                opd_chunk_ids = possible_chunk_ids[..., -response_length:].round().long()
+
         # Special token positions are marked with inf sentinel (real logprobs ∈ (-inf, 0]).
         # Replace them with student logprobs so advantage = 0 → no loss contribution.
         sentinel_mask = torch.isinf(teacher_log_probs)
+        if opd_chunk_ids is not None:
+            sentinel_mask = sentinel_mask | (opd_chunk_ids < 0)
         # --- OPD metrics: count inf tokens in this micro-batch ---
         resp_mask_bool = response_mask.bool()
         opd_inf_tokens = int((sentinel_mask & resp_mask_bool).sum().item())
@@ -1088,9 +1094,37 @@ def compute_policy_loss_opd(
         opd_inf_ratio = opd_inf_tokens / max(opd_valid_tokens, 1)
         # ---
         if sentinel_mask.any():
-            teacher_log_probs = torch.where(sentinel_mask, student_log_probs, teacher_log_probs)
-        # compute_chunk_level_log_probs()
-        advantages = teacher_log_probs - student_log_probs
+            teacher_log_probs = torch.where(sentinel_mask, prior_log_probs, teacher_log_probs)
+
+        # --- Semantic prior-based credit assignment ---
+        # For each synchronized chunk c:
+        #   L_T^(c) = sum of teacher logprobs in chunk
+        #   L_S^(c) = sum of student (prior) logprobs in chunk
+        #   target log q_i = (L_T^(c) / L_S^(c)) * log p_i
+        #   advantage A_i = log q_i - log p_i = (L_T^(c) / L_S^(c) - 1) * log p_i
+        if opd_chunk_ids is None:
+            # Fallback: no chunk info available, use simple difference
+            advantages = teacher_log_probs - prior_log_probs
+        else:
+            target_log_probs = prior_log_probs.clone()
+            for seq_id in range(teacher_log_probs.shape[0]):
+                seq_valid = resp_mask_bool[seq_id] & (~sentinel_mask[seq_id])
+                if not seq_valid.any():
+                    continue
+                for chunk_id in torch.unique(opd_chunk_ids[seq_id][seq_valid]):
+                    chunk_mask = seq_valid & (opd_chunk_ids[seq_id] == chunk_id)
+                    teacher_chunk_logp = teacher_log_probs[seq_id][chunk_mask].sum()
+                    prior_chunk_logp = prior_log_probs[seq_id][chunk_mask].sum()
+                    if torch.abs(prior_chunk_logp) < 1e-8:
+                        # Degenerate case: student assigns ~0 logprob to chunk;
+                        # fall back to uniform distribution of teacher budget
+                        target_log_probs[seq_id][chunk_mask] = teacher_chunk_logp / chunk_mask.sum().clamp_min(1)
+                    else:
+                        # Semantic prior assignment: log q_i = (L_T / L_S) * log p_i
+                        target_log_probs[seq_id][chunk_mask] = (
+                            teacher_chunk_logp / prior_chunk_logp
+                        ) * prior_log_probs[seq_id][chunk_mask]
+            advantages = target_log_probs - prior_log_probs
 
         # Optional per-token advantage clamp (analogous to verl's `loss_max_clamp`).
         # Prevents extreme teacher/student log-prob gaps (e.g. -30) from producing

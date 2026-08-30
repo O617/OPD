@@ -78,6 +78,20 @@ actor_rollout_ref:
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
       opd_loss_max_clamp: null
+      opd_credit_rule: semantic
+      opd_adv_mode: raw
+      opd_adv_power_alpha: 1.0
+      opd_adv_alloc_alpha: 1.0
+      opd_adv_strength_beta: 1.0
+      opd_dctv_beta_d: 0.95
+      opd_dctv_beta_m: 0.95
+      opd_dctv_eps: 1.0e-8
+      opd_dctv_c_cap: 1.0
+      alm_binarization_temp: 1.0
+      alm_diff_fn: binary_ce
+      alm_numerator: chunk_count
+      alm_denominator: chunk_count
+      alm_chunk_clamp: null
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

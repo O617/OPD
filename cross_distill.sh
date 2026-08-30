@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='ON_POLICY_DISTILL'
-exp_name='OPD'
+exp_name='OPD_llama3125_val4'
 
 adv_estimator=opd
 
@@ -42,7 +42,7 @@ RAY_ADDRESS=${RAY_ADDRESS:-"http://<REDACTED_IP>:6379"}
 NNODES=2
 NGPUS_PER_NODE=8
 # Paths
-RAY_DATA_HOME="$DATA_ROOT/OPD"
+RAY_DATA_HOME="$DATA_ROOT/develop/OPD"
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 # MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
 MODEL_PATH="$DATA_ROOT/checkpoint-6250"
@@ -51,8 +51,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 # TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TRAIN_FILE="$DATA_ROOT/deepmath_messages.parquet"
 # TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-TEST_FILE="$DATA_ROOT/output_data.parquet"
-
+# TEST_FILE="$DATA_ROOT/data/output_data.parquet"
+TEST_FILE="[$DATA_ROOT/val_all/aime24.parquet,$DATA_ROOT/val_all/aime25.parquet,$DATA_ROOT/val_all/aime26.parquet,$DATA_ROOT/val_all/math500.parquet]"
 export TEACHER_SERVER_IP="<REDACTED_IP>"
 export TEACHER_SERVER_PORT="15555"
 export TEACHER_N_WORKERS="1"
@@ -60,6 +60,8 @@ export TEACHER_CKPT_PATH="$DATA_ROOT/Qwen3-8B"
 export TEACHER_MAX_SEQ_LEN="30720"
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG=legacy
+# MATH-500 uses n=1 to save eval time; AIME uses default n=4
+export VAL_N_OVERRIDE="HuggingFaceH4/MATH-500:1"
 
 # Algorithm
 temperature=1.0
@@ -80,9 +82,10 @@ gen_tp=2
 fsdp_size=8
 
 # reference run wandb: https://wandb.ai/verl-org/DAPO%20Reproduction%20on%20verl/runs/ow47vvon?nw=nwusertongyuxuan361
-python3 -m verl.trainer.main_ppo \
+python -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
+    +data.val_n_override="HuggingFaceH4/MATH-500:1" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.shuffle=True \
@@ -148,8 +151,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=False \
-    trainer.test_freq=50 \
+    trainer.val_before_train=True \
+    trainer.test_freq=25 \
     trainer.save_freq=500 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=2000 \

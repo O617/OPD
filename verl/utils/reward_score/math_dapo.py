@@ -203,16 +203,26 @@ def is_correct_strict_box(
     Returns:
         Tuple of (score, extracted_prediction)
     """
-    # Extract the relevant part of the prediction
+    # Extract the relevant part of the prediction.
+    # If pause tokens are supplied we honor the original DAPO convention
+    # (100-char window around the last pause). Otherwise search the FULL
+    # response — the previous 100-char tail dropped valid answers when the
+    # model continued reasoning after the boxed answer.
     if pause_tokens_index is not None:
         assert len(pause_tokens_index) == 4
         pred = pred[pause_tokens_index[-1] - 100 :]
-    else:
-        pred = pred[-100:]
 
     # Extract and check the boxed answer
     boxed_pred = last_boxed_only_string(pred)
     extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
+
+    # Normalize whitespace inside the box. Reasoning models often emit
+    # `\boxed{ 73 }` or `\boxed{73 }`; before this strip they were scored as
+    # incorrect against a bare-integer ground truth like "73".
+    if extracted_pred is not None:
+        extracted_pred = extracted_pred.strip()
+
+    gt = gt.strip() if isinstance(gt, str) else gt
 
     return 1 if (extracted_pred == gt) else -1, extracted_pred
 
@@ -256,8 +266,9 @@ def compute_score(
     Returns:
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
-    # Limit solution length for efficiency
-    solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
+    # Search the full response for a boxed answer. The previous 300-char tail
+    # truncation was a training-time micro-optimization that discarded valid
+    # answers when the model produced trailing commentary.
 
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)

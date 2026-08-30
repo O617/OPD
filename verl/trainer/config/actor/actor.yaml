@@ -73,6 +73,82 @@ policy_loss:
   # null disables the clamp.
   opd_loss_max_clamp: null
 
+  # For OPD loss only. Chunk-level credit assignment rule inside each synchronized chunk.
+  # "semantic" (default, paper Eq.7-9): target_i = (L_T / L_S) * log p_i
+  # "uniform"  (P0-1 ablation):        target_i = L_T / n_tokens_in_chunk
+  # Both preserve chunk-level log-prob conservation; on 1:1 chunks both reduce to
+  # target_i = teacher's per-token logp.
+  opd_credit_rule: semantic
+
+  # For OPD loss only. Phase-1/2 magnitude-ablation on the final per-token advantage
+  # A_i = sign(Δ_i) * |Δ_i|. Modes:
+  #   raw                   -- identity (default; standard OPD)
+  #   perm                  -- shuffle |A| within each per-sign group; per-sign Σ|A| preserved
+  #   group_const           -- replace |A| with per-sign-group mean |Δ| (== M=raw, q=uniform)
+  #   sign                  -- |A| := 1 (not scale-matched)
+  #   power                 -- coupled A_i = sign(Δ_i) * |Δ_i|^α  with α = opd_adv_power_alpha
+  #   sign_mass_raw_alloc   -- Phase-2 (2×2 cell): M=c·n_g (scale-matched), q=q_raw
+  #   alloc_power           -- Phase-2 allocation-only sweep, α = opd_adv_alloc_alpha
+  #                            (α=1 ⇔ raw, α=0 ⇔ group_const)
+  #   strength_interp       -- Phase-2 strength-only sweep, β = opd_adv_strength_beta
+  #                            (β=1 ⇔ scale-matched group_const, β=0 ⇔ scale-matched sign)
+  #   dctv                  -- Adaptive Distance-Calibrated TVOPD; A_i = c_t · sign(Δ_i)
+  #                            with c_t = min(c_cap, D̄_{t-1} / (M̄_{t-1} + ε)) computed
+  #                            from EMAs of the sequence-level TV distance and the
+  #                            predicted one-step TV motion. See opd_dctv_* knobs below.
+  # Sentinel tokens (Δ=0) contribute zero gradient in any mode.
+  opd_adv_mode: raw
+
+  # For OPD loss only, when opd_adv_mode=power. Exponent α >= 0 applied to |Δ|.
+  # α=0 ⇔ sign, α=1 ⇔ raw; ignored for other modes.
+  opd_adv_power_alpha: 1.0
+
+  # For OPD loss only, when opd_adv_mode=alloc_power. Exponent α >= 0 controlling
+  # within-sign-group allocation concentration:
+  #   q_i^(α) = |Δ_i|^α / Σ_{sign_group} |Δ_j|^α
+  # α=1 recovers raw allocation, α=0 recovers uniform (== group_const). Ignored otherwise.
+  opd_adv_alloc_alpha: 1.0
+
+  # For OPD loss only, when opd_adv_mode=strength_interp. Interpolation weight β on
+  # the pos-mass fraction: r_β = β·r_raw + (1-β)·r_sign, with total strength preserved.
+  # β=1 ⇔ scale-matched group_const, β=0 ⇔ scale-matched sign. Ignored otherwise.
+  opd_adv_strength_beta: 1.0
+
+  # For OPD loss only, when opd_adv_mode=dctv. EMA smoothing on D̂_t (sequence-level
+  # TV distance estimator, mean of [1-exp(Δ)]_+). Positioned as an estimator
+  # smoothing constant, not a method hparam.
+  opd_dctv_beta_d: 0.95
+
+  # For OPD loss only, when opd_adv_mode=dctv. EMA smoothing on M̂_t
+  # (predicted one-step TV motion, 0.5·η·(G_TV)^2). Estimator smoothing constant.
+  opd_dctv_beta_m: 0.95
+
+  # For OPD loss only, when opd_adv_mode=dctv. Numerical floor in
+  #   c_t = min(c_cap, D̄ / (M̄ + ε))
+  # and in the G_TV = G_scaled / max(c, ε) gradient-norm recovery.
+  opd_dctv_eps: 1.0e-8
+
+  # For OPD loss only, when opd_adv_mode=dctv. Upper bound on c_t. 1.0 is the
+  # natural "don't first-order overshoot pure TV" cap. Values >1 are escape-hatch.
+  opd_dctv_c_cap: 1.0
+
+  # For ALM loss only. Divide chunk log-p by this temperature before the Bernoulli BCE.
+  alm_binarization_temp: 1.0
+
+  # For ALM loss only. Elementwise divergence between chunk Bernoullis.
+  # Phase 1 supports only "binary_ce".
+  alm_diff_fn: binary_ce
+
+  # For ALM loss only. Per-chunk aggregation weight.
+  # "chunk_count" (default), "token_count", or "log1p_token_count".
+  alm_numerator: chunk_count
+
+  # For ALM loss only. Denominator mode. Phase 1 supports only "chunk_count".
+  alm_denominator: chunk_count
+
+  # For ALM loss only. Clamp chunk log-p to [-C, 0] before BCE. null disables.
+  alm_chunk_clamp: null
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

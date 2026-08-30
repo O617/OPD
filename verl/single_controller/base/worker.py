@@ -15,12 +15,16 @@
 the class for Worker
 """
 
+import logging
 import os
+import resource
 import socket
 import warnings
 from dataclasses import dataclass
 
 import ray
+
+logger = logging.getLogger(__name__)
 
 from verl.utils.device import (
     get_torch_device,
@@ -184,6 +188,25 @@ class Worker(WorkerHelper):
             get_visible_devices_keyword().upper(),
         ]
 
+    @staticmethod
+    def _setup_memlock_unlimited():
+        """Raise the locked-memory limit to unlimited for RDMA / InfiniBand.
+
+        NCCL uses ibv_reg_mr to pin memory for RDMA transfers.  In container
+        environments the default memlock limit can be as low as 64 KB, which
+        causes ``ibv_reg_mr_iova2`` to fail with ``Invalid argument``.
+        Calling this early in every worker process avoids that error.
+        """
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+            if soft != resource.RLIM_INFINITY:
+                resource.setrlimit(resource.RLIMIT_MEMLOCK,
+                                   (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+                logger.info("memlock limit raised to unlimited (was soft=%s hard=%s)", soft, hard)
+        except (ValueError, OSError) as exc:
+            logger.warning("Failed to raise memlock limit: %s. "
+                           "RDMA may not work correctly.", exc)
+
     def __init__(self, cuda_visible_devices=None) -> None:
         """Initialize the worker with environment settings and device configuration.
 
@@ -191,6 +214,9 @@ class Worker(WorkerHelper):
             cuda_visible_devices (str, optional):
                 CUDA visible devices configuration. Defaults to None.
         """
+        # Raise memlock limit *before* any NCCL / RDMA operation.
+        self._setup_memlock_unlimited()
+
         # construct a meta from environment variable. Note that the import must be inside the class because
         # it is executed remotely
         import os

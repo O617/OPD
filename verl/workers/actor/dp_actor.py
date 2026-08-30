@@ -91,6 +91,23 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        # DCTV (opd_adv_mode='dctv') controller state. Persists across
+        # ``update_policy`` calls within one run; not serialized to checkpoints
+        # (first few steps after resume behave like pure sign until EMAs warm up,
+        # which is acceptable).
+        #   c            -- c_t currently applied by this and subsequent
+        #                    microbatches; deterministic on all ranks.
+        #   D_ema, M_ema -- EMAs updated after each optimizer step. ``None``
+        #                    before the first update; first sample copies in.
+        #   step         -- Count of optimizer steps taken under 'dctv' mode
+        #                    (used for warmup and debug).
+        self._dctv_state = {
+            "c": 1.0,
+            "D_ema": None,
+            "M_ema": None,
+            "step": 0,
+        }
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -399,6 +416,29 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        # ---- DCTV controller sanity check ----
+        # ``dctv`` mode assumes grad_norm captures the OPD gradient only (up to
+        # scaling by c). Extra loss terms (KL to ref, entropy bonus) would leak
+        # into grad_norm and bias M̂. Reject them explicitly rather than silently
+        # producing a mis-calibrated c_t.
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        pl_cfg = self.config.policy_loss
+        opd_adv_mode = str(pl_cfg.get("opd_adv_mode", "raw"))
+        dctv_active = loss_mode == "opd" and opd_adv_mode == "dctv"
+        if dctv_active:
+            if self.config.use_kl_loss:
+                raise ValueError(
+                    "opd_adv_mode='dctv' is incompatible with actor.use_kl_loss=True: "
+                    "the KL-to-ref term would contaminate grad_norm, biasing the DCTV "
+                    "motion estimator M̂. Disable use_kl_loss or pick another mode."
+                )
+            if self.config.entropy_coeff != 0:
+                raise ValueError(
+                    f"opd_adv_mode='dctv' is incompatible with actor.entropy_coeff="
+                    f"{self.config.entropy_coeff} != 0: the entropy bonus would "
+                    "contaminate grad_norm. Set entropy_coeff=0 or pick another mode."
+                )
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -418,6 +458,13 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+
+                # DCTV per-mini-batch D̂ accumulator (local to this rank).
+                # Reset per mini-batch so each _optimizer_step gets exactly the
+                # microbatches that contributed to *its* gradient. DP reduce
+                # happens after the loop, before EMA update.
+                _dctv_D_sum_local = 0.0
+                _dctv_D_count_local = 0
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -467,6 +514,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # _ca._DEBUG_INPUT_IDS = model_inputs.get("input_ids", None)
                     # _ca._DEBUG_RESPONSES = model_inputs.get("responses", None)
 
+                    # DCTV: pass the past-conditioned c_t only for the OPD loss.
+                    # Other loss fns don't accept this kwarg.
+                    extra_loss_kwargs = {}
+                    if loss_mode == "opd":
+                        extra_loss_kwargs["dctv_c_current"] = float(self._dctv_state["c"])
+
                     # Compute policy loss (any function is expected to return 2 values)
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
@@ -476,8 +529,17 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        **extra_loss_kwargs,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    # Accumulate DCTV D̂ (sum + count on eff_mask, this rank) so
+                    # we can DP-reduce a mini-batch-mean D̂ after the optimizer
+                    # step. pg_metrics carries per-microbatch scalars already.
+                    if dctv_active:
+                        _dctv_D_sum_local += float(pg_metrics.get("actor/opd_dctv_D_sum", 0.0))
+                        _dctv_D_count_local += int(pg_metrics.get("actor/opd_dctv_D_count", 0))
+
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -527,6 +589,105 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+
+                # ---- DCTV controller update (once per optimizer step) ----
+                if dctv_active:
+                    # (1) DP-reduce D̂: sum + count across all DP ranks so the
+                    # controller state is bit-identical on every rank (a
+                    # requirement for keeping c_t deterministic).
+                    _reduce_buf = torch.tensor(
+                        [_dctv_D_sum_local, float(_dctv_D_count_local)],
+                        dtype=torch.float64,
+                        device=get_device_id(),
+                    )
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            _reduce_buf, op=torch.distributed.ReduceOp.SUM
+                        )
+                    _D_sum = _reduce_buf[0].item()
+                    _D_count = _reduce_buf[1].item()
+                    _D_hat = _D_sum / max(_D_count, 1.0)
+
+                    # Cached state prior to any update this step (for logging /
+                    # G_tv reconstruction).
+                    _c_used = float(self._dctv_state["c"])
+                    _eps = float(pl_cfg.get("opd_dctv_eps", 1e-8))
+                    _lr = float(self.actor_optimizer.param_groups[0]["lr"])
+                    _G_scaled_finite = bool(torch.isfinite(grad_norm).item())
+                    _G_scaled = float(grad_norm.detach().item()) if _G_scaled_finite else float("nan")
+
+                    # (2) Recover pure-TV grad norm and (3) predicted one-step TV
+                    # motion. Both are ONLY meaningful when grad_norm is finite;
+                    # in the non-finite branch we log NaN to avoid contaminating
+                    # the wandb time series with junk.
+                    if _G_scaled_finite:
+                        _G_tv = _G_scaled / max(_c_used, _eps)
+                        _M_hat = 0.5 * _lr * (_G_tv ** 2)
+                    else:
+                        _G_tv = float("nan")
+                        _M_hat = float("nan")
+
+                    # (4) EMA / c update — skipped on non-finite grad_norm
+                    # (mirrors the "skip optimizer step" branch in
+                    # _optimizer_step). _c_next defaults to the current c so the
+                    # controller freezes rather than drifting.
+                    _c_next = _c_used
+                    _R = float("nan")
+                    _nonfinite_flag = 0
+                    if _G_scaled_finite:
+                        _beta_d = float(pl_cfg.get("opd_dctv_beta_d", 0.95))
+                        _beta_m = float(pl_cfg.get("opd_dctv_beta_m", 0.95))
+                        _c_cap = float(pl_cfg.get("opd_dctv_c_cap", 1.0))
+
+                        st = self._dctv_state
+                        st["D_ema"] = (
+                            _D_hat
+                            if st["D_ema"] is None
+                            else _beta_d * st["D_ema"] + (1.0 - _beta_d) * _D_hat
+                        )
+                        st["M_ema"] = (
+                            _M_hat
+                            if st["M_ema"] is None
+                            else _beta_m * st["M_ema"] + (1.0 - _beta_m) * _M_hat
+                        )
+                        st["step"] += 1
+
+                        _R = st["D_ema"] / (st["M_ema"] + _eps)
+                        _c_next = min(_c_cap, _R)
+                        st["c"] = _c_next
+                    else:
+                        _nonfinite_flag = 1
+
+                    mini_batch_metrics.update({
+                        # D̂ / M̂ raw samples this step
+                        "actor/opd_dctv_D_hat": _D_hat,
+                        "actor/opd_dctv_D_count": int(_D_count),
+                        "actor/opd_dctv_G_scaled": _G_scaled,
+                        "actor/opd_dctv_G_tv": _G_tv,
+                        "actor/opd_dctv_M_hat": _M_hat,
+                        # EMA-smoothed state after this step's update
+                        "actor/opd_dctv_D_ema": (
+                            float(self._dctv_state["D_ema"])
+                            if self._dctv_state["D_ema"] is not None
+                            else 0.0
+                        ),
+                        "actor/opd_dctv_M_ema": (
+                            float(self._dctv_state["M_ema"])
+                            if self._dctv_state["M_ema"] is not None
+                            else 0.0
+                        ),
+                        # Controller output. R is the primary diagnostic
+                        # (method §7): early/mid should be >>1, tail should
+                        # approach 1 concurrent with instability onset.
+                        "actor/opd_dctv_R": float(_R),
+                        "actor/opd_dctv_c_used": _c_used,
+                        "actor/opd_dctv_c_next": float(_c_next),
+                        # Runtime state
+                        "actor/opd_dctv_lr": _lr,
+                        "actor/opd_dctv_step": int(self._dctv_state["step"]),
+                        "actor/opd_dctv_nonfinite_grad_norm": _nonfinite_flag,
+                    })
+
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

@@ -19,7 +19,7 @@ from teacher import TeacherClient
 
 
 def main():
-    teacher_client = TeacherClient("127.0.0.1", 15555)
+    teacher_client = TeacherClient("<REDACTED_IP>", 15555)
     tokens = [[random.randint(1, 99999) for _ in range(8192)] for _ in range(128)]
     tokens[0][40] = 128858
     _, teacher_topk_logps, teacher_topk_indices = teacher_client.submit(tokens).result()

@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--n-logprobs", type=int, default=256)
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--pp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
     # vLLM engine knobs (forwarded to vllm_engine.VLLMEngine)
@@ -38,6 +39,9 @@ def main():
                         help="vLLM max_num_batched_tokens.")
     parser.add_argument("--max-model-len", type=int, default=30720,
                         help="vLLM max_model_len (prompt+generation).")
+    parser.add_argument("--distributed-executor-backend", type=str, default=None,
+                        choices=["ray", "mp", "external_launcher", None],
+                        help="vLLM distributed executor backend for multi-node.")
     args = parser.parse_args()
 
     if args.backend == "vllm":
@@ -47,9 +51,12 @@ def main():
             args.ckpt_path,
             args.n_logprobs,
             args.tp_size,
+            pp_size=args.pp_size,
+            ep_size=args.ep_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_model_len=args.max_model_len,
+            distributed_executor_backend=args.distributed_executor_backend,
         )
     else:
         raise ValueError(f"Unknown backend: {args.backend}.")

@@ -140,14 +140,24 @@ class VLLMEngine:
         ckpt_path,
         n_logprobs=0,
         tp_size=1,
+        pp_size=1,
+        ep_size=1,
         gpu_memory_utilization=0.5,
         max_num_batched_tokens=8192,
         max_model_len=30720,
+        distributed_executor_backend=None,
     ):
         self.n_logprobs = n_logprobs
-        # self.llm = LLM(ckpt_path, tensor_parallel_size=tp_size, trust_remote_code=True,
-        #                enable_chunked_prefill=False, distributed_executor_backend="ray",
-        #                max_logprobs=n_logprobs, gpu_memory_utilization=0.7)
+
+        # Build extra kwargs for distributed / expert parallelism
+        extra_kwargs = {}
+        if distributed_executor_backend is not None:
+            extra_kwargs["distributed_executor_backend"] = distributed_executor_backend
+        if pp_size > 1:
+            extra_kwargs["pipeline_parallel_size"] = pp_size
+        if ep_size > 1:
+            extra_kwargs["enable_expert_parallel"] = True
+
         self.llm = LLM(
             ckpt_path,
             tensor_parallel_size=tp_size,
@@ -157,6 +167,7 @@ class VLLMEngine:
             gpu_memory_utilization=gpu_memory_utilization,
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
+            **extra_kwargs,
         )
 
     def get_topk_logprobs(self, prompt_token_ids, temperature=0.8, max_new_tokens=1, only_response=False):

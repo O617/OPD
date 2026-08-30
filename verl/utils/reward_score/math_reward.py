@@ -13,6 +13,8 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+import re
+
 
 def compute_score(solution_str, ground_truth) -> float:
     retval = 0.0
@@ -41,7 +43,21 @@ def is_equiv(str1, str2, verbose=False):
         ss2 = strip_string(str2)
         if verbose:
             print(ss1, ss2)
-        return ss1 == ss2
+        if ss1 == ss2:
+            return True
+        # Numeric equivalence fallback: "73" == "73.0" == "73.00", etc.
+        # Only applies when BOTH sides parse as floats — protects against
+        # accidentally matching e.g. "1" against "1e0" in non-numeric contexts
+        # (there aren't any in MATH-500, but be safe).
+        try:
+            f1, f2 = float(ss1), float(ss2)
+            # Small absolute + relative tolerance for MATH answers that
+            # occasionally end up as e.g. 0.333333 vs 1/3 -> 0.3333333333.
+            if abs(f1 - f2) <= 1e-9 + 1e-9 * max(abs(f1), abs(f2)):
+                return True
+        except (ValueError, TypeError):
+            pass
+        return False
     except Exception:
         return str1 == str2
 
@@ -183,6 +199,13 @@ def strip_string(string):
 
     # remove dollar signs
     string = string.replace("\\$", "")
+
+    # Unwrap display-only text wrappers so `\text{5}` matches `5`. Applied
+    # BEFORE unit-stripping so `\text{ km}` still gets picked up there.
+    # Handles \text{...}, \textbf{...}, \textit{...}, \mathrm{...}, \mbox{...}.
+    string = re.sub(r"\\text(?:bf|it)?\{([^{}]*)\}", r"\1", string)
+    string = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", string)
+    string = re.sub(r"\\mbox\{([^{}]*)\}", r"\1", string)
 
     # remove units (on the right)
     string = remove_right_units(string)

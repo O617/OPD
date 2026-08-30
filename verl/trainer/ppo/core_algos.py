@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1031,6 +1032,287 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+def _unpack_opd_signal(
+    advantages: torch.Tensor, response_length: int
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Unpack teacher log-probs and (optional) chunk ids from the reward-manager payload.
+
+    The OPD reward manager concatenates ``[teacher_logps_padded, chunk_ids_padded]`` along
+    ``dim=-1``. This helper handles both packings (with or without chunk ids) and returns:
+
+    - ``teacher_log_probs``: ``[..., T]`` teacher per-token gold log-p, with ``inf`` sentinels
+      for special/unaligned tokens.
+    - ``opd_chunk_ids``: ``[..., T]`` long tensor with chunk ids per token, ``-1`` for
+      sentinels; ``None`` if the payload did not carry chunk ids.
+    """
+    teacher_log_probs = advantages[..., -response_length:]
+    opd_chunk_ids: Optional[torch.Tensor] = None
+    if advantages.shape[-1] % 2 == 0:
+        split = advantages.shape[-1] // 2
+        possible_chunk_ids = advantages[..., split:]
+        finite_chunk_ids = possible_chunk_ids[torch.isfinite(possible_chunk_ids)]
+        has_chunk_id_half = (
+            split >= response_length
+            and finite_chunk_ids.numel() > 0
+            and bool(((finite_chunk_ids == -1) | (finite_chunk_ids >= 0)).all().item())
+            and bool(torch.allclose(finite_chunk_ids, finite_chunk_ids.round()))
+        )
+        if has_chunk_id_half:
+            teacher_log_probs = advantages[..., :split][..., -response_length:]
+            opd_chunk_ids = possible_chunk_ids[..., -response_length:].round().long()
+    return teacher_log_probs, opd_chunk_ids
+
+
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable ``log(1 - exp(x))`` for ``x <= 0``.
+
+    Ported from tokenkit ``training/losses.py``. Uses ``log1p(-exp(x))`` for very negative
+    ``x`` and ``log(-expm1(x))`` for ``x`` near zero, following Mächler (2012).
+    """
+    log_half = math.log(0.5)
+    return torch.where(
+        x < log_half,
+        torch.log1p(-torch.exp(x)),
+        torch.log(-torch.expm1(x)),
+    )
+
+
+def _apply_adv_transform(
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    mode: str,
+    power_alpha: float = 1.0,
+    alloc_alpha: float = 1.0,
+    strength_beta: float = 1.0,
+    dctv_c: float = 1.0,
+) -> torch.Tensor:
+    """Phase-1/2 magnitude-ablation transform on the per-token OPD advantage.
+
+    ``advantages``/``response_mask`` are ``(B, T)``; padding positions
+    (``response_mask == 0``) are always set to 0 in the output regardless of
+    mode, so downstream masked reductions stay well-defined.
+
+    All shaping is per-sign-group and computed **within a single microbatch**.
+    That is: "the group" refers to the union of positive-|Δ| tokens across
+    the whole (B×T) tensor (or the negative-|Δ| tokens), NOT per-response.
+
+    ----------------------------------------------------------------------
+    Phase-1 modes (already used in the magnitude-ablation matrix)
+    ----------------------------------------------------------------------
+    * ``raw`` — identity (zeroed at pads).
+    * ``perm`` — |A| shuffled within each sign group; per-sign Σ|A| exactly
+      preserved, distribution of |A| preserved.
+    * ``group_const`` — |A| replaced with the mean |Δ| of the sign group;
+      per-sign Σ|A| exactly preserved, within-group variance flattened.
+      Equivalent to (M=M_raw, q=q_uniform).
+    * ``sign`` — |A| replaced with 1 (yields A ∈ {-1, 0, +1}). NB: not scale-
+      matched — Σ|A| = n_+ + n_- which typically ≠ Σ|Δ|.
+    * ``power`` — coupled shaping A_t = sign(Δ_t) * |Δ_t|^α with
+      ``power_alpha = α``. Both M_± AND q_± drift with α (this is why the
+      Phase-2 plan splits them into ``alloc_power`` and ``strength_interp``).
+
+    ----------------------------------------------------------------------
+    Phase-2 modes (orthogonal (M_±, q_±) decomposition; w_± = M_± · q_±)
+    ----------------------------------------------------------------------
+    Notation for a sign group g ∈ {+, -} inside one microbatch:
+        n_g       := #tokens in group g
+        S_g^raw   := Σ_{i∈g} |Δ_i|  (== M_g^raw, the raw per-group strength)
+        q_i^raw   := |Δ_i| / S_g^raw for i ∈ g  (raw within-group allocation)
+        q_i^unif  := 1 / n_g        for i ∈ g   (uniform allocation)
+
+    * ``sign_mass_raw_alloc`` — (2×2 factorial cell: M=sign, q=raw)
+        M_g^new := c · n_g   with c := (S_+^raw + S_-^raw) / (n_+ + n_-)
+                              (global scale-match: preserves Σ|A^new| = Σ|Δ|)
+        q_i^new := q_i^raw
+        A_i     := sign(Δ_i) · M_g^new · q_i^raw
+                 = sign(Δ_i) · c · n_g · |Δ_i| / S_g^raw
+      Isolates the effect of replacing raw group-strength (S_g^raw) with
+      count-based group-strength (c · n_g) while keeping the within-group
+      allocation frozen.
+
+    * ``alloc_power`` — allocation-only sweep (M=raw, q=q^(α))
+        q_i^(α) := |Δ_i|^α / Σ_{j∈g} |Δ_j|^α
+        M_g^new := S_g^raw   (raw per-group strength preserved exactly)
+        A_i     := sign(Δ_i) · S_g^raw · q_i^(α)
+      Endpoints: α=1 ≡ ``raw``; α=0 ≡ ``group_const`` (uniform allocation
+      with raw group strength). Intermediate α ∈ (0,1) smoothly compresses
+      within-group allocation without touching M_±.
+      Uses ``alloc_alpha``.
+
+    * ``strength_interp`` — strength-only sweep (M=M(β), q=q_uniform)
+        r_raw  := S_+^raw / (S_+^raw + S_-^raw)     (raw pos-mass fraction)
+        r_sign := n_+ / (n_+ + n_-)                 (count pos-mass fraction)
+        r_β    := β · r_raw + (1-β) · r_sign
+        S      := S_+^raw + S_-^raw                 (total strength, fixed)
+        M_+^β  := r_β · S,   M_-^β := (1-r_β) · S
+        A_i    := sign(Δ_i) · M_g^β / n_g            (q_i^unif per group)
+      Endpoints: β=1 ≡ scale-matched GroupConst (M_g = S_g^raw ⇒ token-level
+      identical to ``group_const``); β=0 ≡ scale-matched Sign (Σ|A|=Σ|Δ|,
+      not Σ|A|=n_++n_-). β=0.5 is the mid-point.
+      Uses ``strength_beta``.
+
+    ----------------------------------------------------------------------
+    Adaptive Distance-Calibrated TVOPD
+    ----------------------------------------------------------------------
+    * ``dctv`` — A_i := ``dctv_c`` · sign(Δ_i) on valid tokens (pads/zero-Δ
+      remain 0). ``dctv_c`` is a scalar computed by the caller from the
+      *previous* step's EMAs of the sequence-level TV distance estimator
+      (D̄_{t-1}) and the predicted one-step TV motion (M̄_{t-1}), so from the
+      transform's perspective it is just a global multiplier on top of the
+      pure-sign field. See :class:`PolicyLossConfig`'s ``opd_dctv_*`` knobs
+      and the DCTV controller in :meth:`DataParallelPPOActor.update_policy`.
+
+    Zero-Δ positions carry ``sign(0) = 0`` and contribute no signal in any
+    mode, which matches the sentinel-token invariant used elsewhere in the
+    OPD loss (sentinel Δ = 0 → no gradient contribution). Degenerate groups
+    (n_g == 0 or S_g^raw == 0) contribute nothing.
+    """
+    if mode == "raw":
+        return advantages * response_mask.to(advantages.dtype)
+
+    mask_bool = response_mask.bool()
+    signs = torch.sign(advantages)
+    mags = advantages.abs()
+
+    pos_mask = mask_bool & (signs > 0)
+    neg_mask = mask_bool & (signs < 0)
+
+    new_mags = torch.zeros_like(mags)
+
+    if mode == "perm":
+        # Random per-sign-group permutation of the valid magnitudes. Uses
+        # torch.randperm on device indices; verl doesn't seed torch.manual_seed
+        # per-microbatch so different microbatches get independent perms —
+        # acceptable for a randomization ablation.
+        for group_mask in (pos_mask, neg_mask):
+            n = int(group_mask.sum().item())
+            if n == 0:
+                continue
+            grp_mags = mags[group_mask]
+            perm = torch.randperm(n, device=grp_mags.device)
+            new_mags[group_mask] = grp_mags[perm]
+        return signs * new_mags
+
+    if mode == "group_const":
+        for group_mask in (pos_mask, neg_mask):
+            n = int(group_mask.sum().item())
+            if n == 0:
+                continue
+            mean_mag = mags[group_mask].mean()
+            new_mags[group_mask] = mean_mag
+        return signs * new_mags
+
+    if mode == "sign":
+        # |A| == 1 on all valid non-zero-Δ tokens; sign(0)=0 keeps degenerate
+        # tokens contributing zero. Multiplied by response_mask so pads stay 0.
+        return signs * response_mask.to(advantages.dtype)
+
+    if mode == "power":
+        # A_t = sign(Δ_t) * |Δ_t|^α, masked at pads. α outside [0,1] is
+        # allowed (users may want α>1 to over-emphasize magnitude), but
+        # α<0 is rejected because it blows up on small |Δ|.
+        if power_alpha < 0:
+            raise ValueError(f"opd_adv_power_alpha must be >= 0, got {power_alpha}")
+        valid = mask_bool & (mags > 0)  # sign(0)=0 → keep Δ=0 tokens zero
+        new_mags[valid] = mags[valid].pow(power_alpha)
+        return signs * new_mags
+
+    if mode == "sign_mass_raw_alloc":
+        # Phase-2 (2×2 missing cell): M = c·n_g (count-based, globally scale-
+        # matched so Σ|A^new| = Σ|Δ|); q = q_raw (raw within-group alloc).
+        n_pos = int(pos_mask.sum().item())
+        n_neg = int(neg_mask.sum().item())
+        n_total = n_pos + n_neg
+        if n_total == 0:
+            return new_mags  # nothing to do
+        s_pos = mags[pos_mask].sum() if n_pos > 0 else advantages.new_zeros(())
+        s_neg = mags[neg_mask].sum() if n_neg > 0 else advantages.new_zeros(())
+        s_total = s_pos + s_neg
+        # Guard degenerate microbatch where every valid |Δ| is zero.
+        if not torch.isfinite(s_total) or s_total.item() <= 0:
+            return signs * new_mags
+        c = s_total / float(n_total)  # global scale-match constant
+        for group_mask, n_g, s_g in (
+            (pos_mask, n_pos, s_pos),
+            (neg_mask, n_neg, s_neg),
+        ):
+            if n_g == 0 or s_g.item() <= 0:
+                continue
+            m_g = c * float(n_g)  # M_g^new = c · n_g
+            # q_i^raw = |Δ_i| / s_g  ⇒  |A_i^new| = m_g · q_i^raw
+            new_mags[group_mask] = m_g * mags[group_mask] / s_g
+        return signs * new_mags
+
+    if mode == "alloc_power":
+        # Phase-2 allocation-only sweep: M = M_raw exactly; q_i^(α) = |Δ_i|^α /
+        # Σ_g |Δ_j|^α. α=1 ≡ raw, α=0 ≡ group_const.
+        if alloc_alpha < 0:
+            raise ValueError(f"opd_adv_alloc_alpha must be >= 0, got {alloc_alpha}")
+        for group_mask in (pos_mask, neg_mask):
+            n_g = int(group_mask.sum().item())
+            if n_g == 0:
+                continue
+            grp_mags = mags[group_mask]
+            s_g = grp_mags.sum()
+            if s_g.item() <= 0:
+                continue
+            # q_i^(α): |Δ_i|^α normalised over the sign group. α=0 uses
+            # {|Δ|>0 → 1, else 0} rather than 0^0 = 1 so zero-Δ tokens stay
+            # inert (matches sentinel semantics).
+            if alloc_alpha == 0:
+                pow_mags = (grp_mags > 0).to(grp_mags.dtype)
+            else:
+                pow_mags = grp_mags.pow(alloc_alpha)
+            denom = pow_mags.sum()
+            if denom.item() <= 0:
+                continue
+            # |A_i^new| = M_g^raw · q_i^(α) = s_g · pow_mags / denom.
+            new_mags[group_mask] = s_g * pow_mags / denom
+        return signs * new_mags
+
+    if mode == "strength_interp":
+        # Phase-2 strength-only sweep: q = q_uniform; M_+/M_- interpolates
+        # between raw pos-mass fraction (β=1) and count-based (β=0) at fixed
+        # total strength S = S_+^raw + S_-^raw.
+        n_pos = int(pos_mask.sum().item())
+        n_neg = int(neg_mask.sum().item())
+        n_total = n_pos + n_neg
+        if n_total == 0:
+            return new_mags
+        s_pos = mags[pos_mask].sum() if n_pos > 0 else advantages.new_zeros(())
+        s_neg = mags[neg_mask].sum() if n_neg > 0 else advantages.new_zeros(())
+        s_total = s_pos + s_neg
+        if not torch.isfinite(s_total) or s_total.item() <= 0:
+            return signs * new_mags
+        # r_raw = S+ / (S+ + S-); r_sign = n+ / (n+ + n-).
+        # Degenerate one-sided cases: if a group is empty, that endpoint of
+        # r_* is 1.0 (all mass on the other sign), which the below handles
+        # naturally because n_g == 0 ⇒ that group's assignment is skipped.
+        r_raw = (s_pos / s_total).item()
+        r_sign = float(n_pos) / float(n_total)
+        r_beta = strength_beta * r_raw + (1.0 - strength_beta) * r_sign
+        # Clamp to [0,1] to be safe against numerical drift when β is
+        # outside [0,1]; users can still pass β<0 or β>1 to extrapolate.
+        r_beta = max(0.0, min(1.0, r_beta))
+        m_pos = r_beta * s_total.item()
+        m_neg = (1.0 - r_beta) * s_total.item()
+        if n_pos > 0 and m_pos > 0:
+            new_mags[pos_mask] = m_pos / float(n_pos)
+        if n_neg > 0 and m_neg > 0:
+            new_mags[neg_mask] = m_neg / float(n_neg)
+        return signs * new_mags
+
+    if mode == "dctv":
+        # Adaptive Distance-Calibrated TVOPD: |A| = dctv_c on all valid non-zero-Δ
+        # tokens; sign(0)=0 keeps degenerate tokens at 0. dctv_c is a
+        # deterministic (past-conditioned) global scalar computed by the caller
+        # from D̄_{t-1} / (M̄_{t-1} + ε). This branch treats it as an opaque
+        # multiplier — controller state lives in DataParallelPPOActor.
+        return signs * response_mask.to(advantages.dtype) * float(dctv_c)
+
+    raise ValueError(f"Unknown opd_adv_mode={mode!r}")
+
+
 @register_policy_loss("opd")  # type: ignore[arg-type]
 def compute_policy_loss_opd(
     old_log_prob: torch.Tensor,
@@ -1040,6 +1322,7 @@ def compute_policy_loss_opd(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    dctv_c_current: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for OPD.
@@ -1059,28 +1342,23 @@ def compute_policy_loss_opd(
             config for the actor.
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+        dctv_c_current (float, optional): DCTV controller's current scalar c_t.
+            Only consumed when ``opd_adv_mode='dctv'``; ignored otherwise. Must be
+            the *past-conditioned* value (min(c_cap, D̄_{t-1}/(M̄_{t-1}+ε))) so
+            the transform is deterministic w.r.t. the current stochastic Δ.
+            Defaults to 1.0 (equivalent to pure sign when combined with mode='dctv').
     """
     
-    student_log_probs = log_prob.detach()
+    prior_log_probs = old_log_prob.detach()
     with torch.no_grad():
-        def compute_chunk_level_log_probs():
-            bsz, seqlen = teacher_log_probs.shape
-            for seq_id in range(bsz):
-                counter = 0
-                teacher_seq = teacher_log_probs[seq_id]
-                student_seq = student_log_probs[seq_id]
-                for token_idx in range(seqlen):
-                    if teacher_seq[token_idx] == teacher_seq[counter]:
-                        continue
-                    else:
-                        student_log_probs[seq_id, counter:token_idx] = torch.mean(student_seq[counter:token_idx])
-                        counter = token_idx
+        response_length = prior_log_probs.shape[-1]
+        teacher_log_probs, opd_chunk_ids = _unpack_opd_signal(advantages, response_length)
 
-        response_length = student_log_probs.shape[-1]
-        teacher_log_probs = advantages[..., -response_length:]
         # Special token positions are marked with inf sentinel (real logprobs ∈ (-inf, 0]).
         # Replace them with student logprobs so advantage = 0 → no loss contribution.
         sentinel_mask = torch.isinf(teacher_log_probs)
+        if opd_chunk_ids is not None:
+            sentinel_mask = sentinel_mask | (opd_chunk_ids < 0)
         # --- OPD metrics: count inf tokens in this micro-batch ---
         resp_mask_bool = response_mask.bool()
         opd_inf_tokens = int((sentinel_mask & resp_mask_bool).sum().item())
@@ -1088,9 +1366,57 @@ def compute_policy_loss_opd(
         opd_inf_ratio = opd_inf_tokens / max(opd_valid_tokens, 1)
         # ---
         if sentinel_mask.any():
-            teacher_log_probs = torch.where(sentinel_mask, student_log_probs, teacher_log_probs)
-        # compute_chunk_level_log_probs()
-        advantages = teacher_log_probs - student_log_probs
+            teacher_log_probs = torch.where(sentinel_mask, prior_log_probs, teacher_log_probs)
+
+        # --- Credit assignment inside each synchronized chunk ---
+        # opd_credit_rule selects how the teacher chunk log-likelihood is
+        # distributed to student tokens *inside the chunk*. All rules preserve
+        # chunk-level log-prob conservation: sum_i target_i == L_T^(c).
+        #
+        #   semantic (default, paper Eq.7-9):
+        #     target_i = (L_T^(c) / L_S^(c)) * log p_i
+        #   uniform (P0-1 ablation):
+        #     target_i = L_T^(c) / n_tokens_in_chunk
+        #
+        # On 1:1 chunks (single-token) all rules reduce to target_i = L_T^(c),
+        # i.e. the standard per-token teacher logprob.
+        credit_rule = "semantic"
+        _pl_cfg = config.get("policy_loss", None) if hasattr(config, "get") else None
+        if _pl_cfg is not None:
+            _rule = _pl_cfg.get("opd_credit_rule", None)
+            if _rule is not None:
+                credit_rule = str(_rule).lower()
+        if credit_rule not in ("semantic", "uniform"):
+            raise ValueError(
+                f"Unknown opd_credit_rule={credit_rule!r}; expected 'semantic' or 'uniform'."
+            )
+
+        if opd_chunk_ids is None:
+            # Fallback: no chunk info available, use simple difference
+            advantages = teacher_log_probs - prior_log_probs
+        else:
+            target_log_probs = prior_log_probs.clone()
+            for seq_id in range(teacher_log_probs.shape[0]):
+                seq_valid = resp_mask_bool[seq_id] & (~sentinel_mask[seq_id])
+                if not seq_valid.any():
+                    continue
+                for chunk_id in torch.unique(opd_chunk_ids[seq_id][seq_valid]):
+                    chunk_mask = seq_valid & (opd_chunk_ids[seq_id] == chunk_id)
+                    teacher_chunk_logp = teacher_log_probs[seq_id][chunk_mask].sum()
+                    n_in_chunk = chunk_mask.sum().clamp_min(1)
+                    if credit_rule == "uniform":
+                        target_log_probs[seq_id][chunk_mask] = teacher_chunk_logp / n_in_chunk
+                    else:
+                        prior_chunk_logp = prior_log_probs[seq_id][chunk_mask].sum()
+                        if torch.abs(prior_chunk_logp) < 1e-8:
+                            # Degenerate case: student assigns ~0 logprob to chunk;
+                            # fall back to uniform distribution of teacher budget
+                            target_log_probs[seq_id][chunk_mask] = teacher_chunk_logp / n_in_chunk
+                        else:
+                            target_log_probs[seq_id][chunk_mask] = (
+                                teacher_chunk_logp / prior_chunk_logp
+                            ) * prior_log_probs[seq_id][chunk_mask]
+            advantages = target_log_probs - prior_log_probs
 
         # Optional per-token advantage clamp (analogous to verl's `loss_max_clamp`).
         # Prevents extreme teacher/student log-prob gaps (e.g. -30) from producing
@@ -1104,6 +1430,214 @@ def compute_policy_loss_opd(
             opd_loss_max_clamp = policy_loss_cfg.get("opd_loss_max_clamp", None)
         if opd_loss_max_clamp is not None:
             advantages = torch.clamp(advantages, min=-opd_loss_max_clamp, max=opd_loss_max_clamp)
+
+        # --- OPD Δ diagnostics (computed on raw Δ, BEFORE optional sign ablation) ---
+        # Δ_t := teacher_log_probs - prior_log_probs on sampled tokens.
+        # eff_mask excludes sentinel positions (where teacher was substituted with
+        # student → Δ=0), so distribution-shape stats aren't biased by them.
+        _eff_mask = resp_mask_bool & (~sentinel_mask)
+        _n_eff = int(_eff_mask.sum().item())
+        if _n_eff > 0:
+            _adv_flat = advantages[_eff_mask]
+            _abs_flat = _adv_flat.abs()
+            _pos_mask = _adv_flat > 0
+            _neg_mask = _adv_flat < 0
+            _n_pos = int(_pos_mask.sum().item())
+            _n_neg = int(_neg_mask.sum().item())
+            opd_adv_mean = _adv_flat.mean().item()
+            opd_adv_abs_mean = _abs_flat.mean().item()
+            opd_adv_pos_mean = _adv_flat[_pos_mask].mean().item() if _n_pos > 0 else 0.0
+            opd_adv_neg_abs_mean = (-_adv_flat[_neg_mask]).mean().item() if _n_neg > 0 else 0.0
+            _abs_f32 = _abs_flat.float()
+            opd_adv_abs_p50 = torch.quantile(_abs_f32, 0.5).item()
+            opd_adv_abs_p90 = torch.quantile(_abs_f32, 0.9).item()
+            opd_adv_near_zero_ratio = (_abs_flat < 0.1).float().mean().item()
+            _tch_flat = teacher_log_probs[_eff_mask]
+            _stu_flat = prior_log_probs[_eff_mask]
+            opd_teacher_sample_logp_mean = _tch_flat.mean().item()
+            opd_student_sample_logp_mean = _stu_flat.mean().item()
+            opd_teacher_sample_logp_pos_mean = _tch_flat[_pos_mask].mean().item() if _n_pos > 0 else 0.0
+            opd_student_sample_logp_pos_mean = _stu_flat[_pos_mask].mean().item() if _n_pos > 0 else 0.0
+            opd_teacher_sample_logp_neg_mean = _tch_flat[_neg_mask].mean().item() if _n_neg > 0 else 0.0
+            opd_student_sample_logp_neg_mean = _stu_flat[_neg_mask].mean().item() if _n_neg > 0 else 0.0
+        else:
+            opd_adv_mean = 0.0
+            opd_adv_abs_mean = 0.0
+            opd_adv_pos_mean = 0.0
+            opd_adv_neg_abs_mean = 0.0
+            opd_adv_abs_p50 = 0.0
+            opd_adv_abs_p90 = 0.0
+            opd_adv_near_zero_ratio = 0.0
+            opd_teacher_sample_logp_mean = 0.0
+            opd_student_sample_logp_mean = 0.0
+            opd_teacher_sample_logp_pos_mean = 0.0
+            opd_student_sample_logp_pos_mean = 0.0
+            opd_teacher_sample_logp_neg_mean = 0.0
+            opd_student_sample_logp_neg_mean = 0.0
+
+        # --- DCTV sequence-level TV distance estimator ---
+        # Per-token d_i := [1 - exp(Δ_i)]_+ ∈ [0,1]; under student sampling
+        # E[d_i | s_i] = TV(π_T(·|s_i), π_S(·|s_i)). Reduce to the per-microbatch
+        # token-level mean on eff_mask; the DP-reduced mini-batch mean is then
+        # used by the DCTV controller in the actor loop (see
+        # ``DataParallelPPOActor.update_policy``). Emit both the sum and the
+        # count so downstream can do a tokens-weighted global average.
+        # NOTE: computed on ``advantages`` at this point in the function, i.e.
+        # AFTER chunk credit assignment and AFTER optional ``opd_loss_max_clamp``,
+        # BEFORE any magnitude ablation. This keeps D̂ tied to the actual
+        # per-token Δ that the loss consumes.
+        if _n_eff > 0:
+            _dctv_d = torch.clamp(1.0 - torch.exp(advantages), min=0.0)
+            _dctv_d = _dctv_d * _eff_mask.to(_dctv_d.dtype)
+            opd_dctv_D_sum_microbatch = _dctv_d.sum().item()
+            opd_dctv_D_count_microbatch = int(_n_eff)
+            opd_dctv_D_hat_microbatch = opd_dctv_D_sum_microbatch / max(
+                opd_dctv_D_count_microbatch, 1
+            )
+        else:
+            opd_dctv_D_sum_microbatch = 0.0
+            opd_dctv_D_count_microbatch = 0
+            opd_dctv_D_hat_microbatch = 0.0
+
+        # Optional Phase-1/2 magnitude ablation on the final per-token advantage.
+        # Modes are documented on ``PolicyLossConfig.opd_adv_mode`` and
+        # implemented in :func:`_apply_adv_transform`:
+        #   * ``raw`` (default) — identity
+        #   * ``perm`` — shuffle |A| within each sign group (Σ|A|+, Σ|A|- preserved)
+        #   * ``group_const`` — replace |A| with per-sign-group mean |Δ|
+        #     (== M=M_raw, q=q_uniform)
+        #   * ``sign`` — replace |A| with 1 (equivalent to the removed
+        #     ``opd_advantage_sign_only`` flag; not scale-matched)
+        #   * ``power`` — coupled shaping A_t = sign(Δ_t) * |Δ_t|^α with α =
+        #     ``opd_adv_power_alpha`` (default 1.0; α=0 ⇔ sign, α=1 ⇔ raw).
+        #     Both M_± and q_± drift with α.
+        #   * ``sign_mass_raw_alloc`` — Phase-2 (2×2 factorial cell): M=c·n_g
+        #     (scale-matched), q=q_raw. Isolates the M swap.
+        #   * ``alloc_power`` — Phase-2 allocation-only sweep: M=M_raw,
+        #     q_i^(α)=|Δ_i|^α / Σ_g |Δ_j|^α. Uses ``opd_adv_alloc_alpha``.
+        #     α=1 ⇔ raw, α=0 ⇔ group_const.
+        #   * ``strength_interp`` — Phase-2 strength-only sweep: q=q_uniform,
+        #     r_β=β·r_raw+(1-β)·r_sign. Uses ``opd_adv_strength_beta``.
+        #     β=1 ⇔ scale-matched group_const, β=0 ⇔ scale-matched sign.
+        #   * ``dctv`` — Adaptive Distance-Calibrated TVOPD. |A|=c_t on valid
+        #     non-zero-Δ tokens, where c_t is provided by the caller via the
+        #     ``dctv_c_current`` kwarg (past-conditioned; see
+        #     :meth:`DataParallelPPOActor.update_policy`).
+        # Sentinel tokens have Δ=0 → sign(0)=0 → no gradient contribution in
+        # any mode, matching the sentinel semantics used above.
+        # Enabled via:
+        #   actor_rollout_ref.actor.policy_loss.opd_adv_mode=<mode>
+        #   actor_rollout_ref.actor.policy_loss.opd_adv_power_alpha=<float>
+        #   actor_rollout_ref.actor.policy_loss.opd_adv_alloc_alpha=<float>
+        #   actor_rollout_ref.actor.policy_loss.opd_adv_strength_beta=<float>
+        opd_adv_mode = "raw"
+        opd_adv_power_alpha = 1.0
+        opd_adv_alloc_alpha = 1.0
+        opd_adv_strength_beta = 1.0
+        opd_dctv_beta_d_cfg = 0.95
+        opd_dctv_beta_m_cfg = 0.95
+        opd_dctv_eps_cfg = 1e-8
+        opd_dctv_c_cap_cfg = 1.0
+        if policy_loss_cfg is not None:
+            opd_adv_mode = str(policy_loss_cfg.get("opd_adv_mode", "raw"))
+            opd_adv_power_alpha = float(policy_loss_cfg.get("opd_adv_power_alpha", 1.0))
+            opd_adv_alloc_alpha = float(policy_loss_cfg.get("opd_adv_alloc_alpha", 1.0))
+            opd_adv_strength_beta = float(policy_loss_cfg.get("opd_adv_strength_beta", 1.0))
+            opd_dctv_beta_d_cfg = float(policy_loss_cfg.get("opd_dctv_beta_d", 0.95))
+            opd_dctv_beta_m_cfg = float(policy_loss_cfg.get("opd_dctv_beta_m", 0.95))
+            opd_dctv_eps_cfg = float(policy_loss_cfg.get("opd_dctv_eps", 1e-8))
+            opd_dctv_c_cap_cfg = float(policy_loss_cfg.get("opd_dctv_c_cap", 1.0))
+        if opd_adv_mode != "raw":
+            advantages = _apply_adv_transform(
+                advantages,
+                response_mask,
+                opd_adv_mode,
+                power_alpha=opd_adv_power_alpha,
+                alloc_alpha=opd_adv_alloc_alpha,
+                strength_beta=opd_adv_strength_beta,
+                dctv_c=float(dctv_c_current),
+            )
+
+        # Post-transform diagnostics: |A| mean and N_eff ratio on the tensor
+        # actually consumed by PPO. Combined with the pre-transform
+        # ``actor/opd_adv_abs_mean`` above (raw Δ distribution) these anchor
+        # the shaping story: for ``perm`` they should match raw's abs_mean and
+        # n_eff_ratio; for ``group_const`` abs_mean matches raw but n_eff
+        # jumps toward 1; for ``sign`` both saturate near 1.
+        _adv_transformed_flat = advantages[_eff_mask] if _n_eff > 0 else None
+        if _adv_transformed_flat is not None and _adv_transformed_flat.numel() > 0:
+            _abs_adv_t = _adv_transformed_flat.abs()
+            opd_adv_transformed_abs_mean = _abs_adv_t.mean().item()
+            _sum_abs = _abs_adv_t.sum()
+            _sum_sq = (_adv_transformed_flat * _adv_transformed_flat).sum()
+            if _sum_sq.item() > 0:
+                opd_adv_n_eff_ratio = float(
+                    ((_sum_abs * _sum_abs) / _sum_sq / float(_abs_adv_t.numel())).item()
+                )
+            else:
+                opd_adv_n_eff_ratio = 0.0
+        else:
+            opd_adv_transformed_abs_mean = 0.0
+            opd_adv_n_eff_ratio = 0.0
+
+        # --- Phase-2 (M_±, q_±) decomposition diagnostics ---
+        # Computed on the POST-transform advantages restricted to eff_mask, then
+        # split by sign into groups g ∈ {+, -}. All metrics here are per-
+        # microbatch and averaged across microbatches by the metric aggregator.
+        #   M_g          := Σ_{i∈g} |A_i^new|   (per-sign total strength)
+        #   n_g          := #{i∈g}
+        #   q_i          := |A_i^new| / M_g     (per-sign allocation dist.)
+        #   H(q_g)       := -Σ_i q_i log q_i     (in nats)
+        #   H_norm(q_g)  := H(q_g) / log(n_g)   (∈ [0,1]; 1 == uniform)
+        # Also record Σ|A^new| / Σ|Δ| (scale ratio vs raw) so scale-matching
+        # can be verified — for {raw, perm, group_const, sign_mass_raw_alloc,
+        # alloc_power, strength_interp} this should be ~1.0.
+        opd_M_pos = 0.0
+        opd_M_neg = 0.0
+        opd_M_pos_over_neg = 0.0  # M_+ / M_- (∞-safe; 0 if M_- == 0)
+        opd_Hq_pos = 0.0
+        opd_Hq_neg = 0.0
+        opd_Hq_pos_norm = 0.0
+        opd_Hq_neg_norm = 0.0
+        opd_n_pos_transformed = 0
+        opd_n_neg_transformed = 0
+        opd_adv_scale_ratio = 0.0  # Σ|A^new| / Σ|Δ|
+        if _adv_transformed_flat is not None and _adv_transformed_flat.numel() > 0:
+            _sign_t = torch.sign(_adv_transformed_flat)
+            _pos_t = _sign_t > 0
+            _neg_t = _sign_t < 0
+            _abs_t = _adv_transformed_flat.abs().float()  # float32 for stable log
+            opd_n_pos_transformed = int(_pos_t.sum().item())
+            opd_n_neg_transformed = int(_neg_t.sum().item())
+            for is_pos, mask_g in ((True, _pos_t), (False, _neg_t)):
+                n_g = int(mask_g.sum().item())
+                if n_g <= 0:
+                    continue
+                m_g = _abs_t[mask_g].sum()
+                if m_g.item() <= 0:
+                    continue
+                q = _abs_t[mask_g] / m_g
+                # Guard log(0): mask out zero-q entries. Since q sums to 1 and
+                # is nonnegative, log2 ≥ log; keep in nats (ln) for standard H.
+                q_nz = q[q > 0]
+                h = -(q_nz * torch.log(q_nz)).sum().item()
+                # log(n_g) is the max entropy (uniform). Guard n_g == 1.
+                h_norm = h / math.log(n_g) if n_g > 1 else 0.0
+                if is_pos:
+                    opd_M_pos = m_g.item()
+                    opd_Hq_pos = h
+                    opd_Hq_pos_norm = h_norm
+                else:
+                    opd_M_neg = m_g.item()
+                    opd_Hq_neg = h
+                    opd_Hq_neg_norm = h_norm
+            if opd_M_neg > 0:
+                opd_M_pos_over_neg = opd_M_pos / opd_M_neg
+            # Σ|A^new| / Σ|Δ|. Reuse pre-transform stats: opd_adv_abs_mean is
+            # (Σ|Δ|)/n_eff on the same eff_mask, so Σ|Δ| = opd_adv_abs_mean * n_eff.
+            _sum_abs_delta = opd_adv_abs_mean * float(_n_eff)
+            if _sum_abs_delta > 0:
+                opd_adv_scale_ratio = float(_sum_abs.item() / _sum_abs_delta)
 
         # # ---- DEBUG: write seq 0 per-token student logprobs and advantages to file ----
         # # Actor worker stdout is captured by Ray, so write to a file instead.
@@ -1237,8 +1771,235 @@ def compute_policy_loss_opd(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/opd_inf_tokens": opd_inf_tokens,
         "actor/opd_inf_ratio": opd_inf_ratio,
+        "actor/opd_adv_pos_ratio": verl_F.masked_mean(
+            (advantages > 0).float(), response_mask
+        ).detach().item(),
+        "actor/opd_adv_neg_ratio": verl_F.masked_mean(
+            (advantages < 0).float(), response_mask
+        ).detach().item(),
+        # Δ magnitude / shape diagnostics (computed pre-sign, on eff_mask = response_mask & ~sentinel)
+        "actor/opd_adv_mean": opd_adv_mean,
+        "actor/opd_adv_abs_mean": opd_adv_abs_mean,
+        "actor/opd_adv_pos_mean": opd_adv_pos_mean,
+        "actor/opd_adv_neg_abs_mean": opd_adv_neg_abs_mean,
+        "actor/opd_adv_abs_p50": opd_adv_abs_p50,
+        "actor/opd_adv_abs_p90": opd_adv_abs_p90,
+        "actor/opd_adv_near_zero_ratio": opd_adv_near_zero_ratio,
+        # Sampled-token teacher/student logp distributions (cheap; no extra inference)
+        "actor/opd_teacher_sample_logp_mean": opd_teacher_sample_logp_mean,
+        "actor/opd_student_sample_logp_mean": opd_student_sample_logp_mean,
+        "actor/opd_teacher_sample_logp_pos_mean": opd_teacher_sample_logp_pos_mean,
+        "actor/opd_student_sample_logp_pos_mean": opd_student_sample_logp_pos_mean,
+        "actor/opd_teacher_sample_logp_neg_mean": opd_teacher_sample_logp_neg_mean,
+        "actor/opd_student_sample_logp_neg_mean": opd_student_sample_logp_neg_mean,
+        # Post-transform magnitude ablation diagnostics (see opd_adv_mode)
+        "actor/opd_adv_transformed_abs_mean": opd_adv_transformed_abs_mean,
+        "actor/opd_adv_n_eff_ratio": opd_adv_n_eff_ratio,
+        "actor/opd_adv_power_alpha": opd_adv_power_alpha,
+        "actor/opd_adv_alloc_alpha": opd_adv_alloc_alpha,
+        "actor/opd_adv_strength_beta": opd_adv_strength_beta,
+        # Phase-2 (M_±, q_±) decomposition diagnostics on post-transform |A|.
+        # M_g = Σ|A_i^new| for i in sign group g; q_i = |A_i^new| / M_g;
+        # H(q_g) in nats; H_norm(q_g) = H(q_g) / log(n_g) ∈ [0,1] with 1 == uniform.
+        # opd_adv_scale_ratio = Σ|A^new| / Σ|Δ| — should be ~1 for scale-matched
+        # modes (raw / perm / group_const / sign_mass_raw_alloc / alloc_power /
+        # strength_interp); ≠1 diagnoses drift.
+        "actor/opd_M_pos": opd_M_pos,
+        "actor/opd_M_neg": opd_M_neg,
+        "actor/opd_M_pos_over_neg": opd_M_pos_over_neg,
+        "actor/opd_Hq_pos": opd_Hq_pos,
+        "actor/opd_Hq_neg": opd_Hq_neg,
+        "actor/opd_Hq_pos_norm": opd_Hq_pos_norm,
+        "actor/opd_Hq_neg_norm": opd_Hq_neg_norm,
+        "actor/opd_n_pos_transformed": opd_n_pos_transformed,
+        "actor/opd_n_neg_transformed": opd_n_neg_transformed,
+        "actor/opd_adv_scale_ratio": opd_adv_scale_ratio,
+        # DCTV per-microbatch stats. ``opd_dctv_D_sum`` / ``opd_dctv_D_count``
+        # are the raw sum + eff-mask count of d_i on this microbatch (used by
+        # the actor loop to build a DP-reduced mini-batch mean before updating
+        # the D_ema state). ``opd_dctv_D_hat`` is the local per-microbatch
+        # mean, kept for logging convenience. ``opd_dctv_c_current`` echoes
+        # the caller-provided c_t so the log ties back to which controller
+        # value shaped this microbatch's |A|.
+        "actor/opd_dctv_D_sum": opd_dctv_D_sum_microbatch,
+        "actor/opd_dctv_D_count": opd_dctv_D_count_microbatch,
+        "actor/opd_dctv_D_hat_microbatch": opd_dctv_D_hat_microbatch,
+        "actor/opd_dctv_c_current": float(dctv_c_current),
+        # DCTV hyperparam echoes (mirror the opd_adv_power_alpha / alloc_alpha /
+        # strength_beta echoes above). Constant per-run in practice but logged so
+        # per-run wandb pages carry the estimator smoothing constants directly.
+        "actor/opd_dctv_beta_d": opd_dctv_beta_d_cfg,
+        "actor/opd_dctv_beta_m": opd_dctv_beta_m_cfg,
+        "actor/opd_dctv_eps": opd_dctv_eps_cfg,
+        "actor/opd_dctv_c_cap": opd_dctv_c_cap_cfg,
     }
     return pg_loss, pg_metrics
+
+
+@register_policy_loss("alm")  # type: ignore[arg-type]
+def compute_alm_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Chunk-level supervised distillation loss in the ALM style (Minixhofer et al., 2025).
+
+    Consumes the same ``[teacher_logps | chunk_ids]`` payload the OPD reward manager writes
+    into ``advantages`` (see :func:`_unpack_opd_signal`). Unlike :func:`compute_policy_loss_opd`
+    the teacher signal here is *not* a reward: we treat each aligned chunk as a Bernoulli
+    ``{p, 1-p}`` on both sides (``p = exp(sum log p_token)``) and minimize the binary CE
+    between the teacher and student Bernoullis. Gradient flows directly through the
+    student chunk-sum log-p — no PPO ratio, no rollout, no clip.
+
+    Signature is kept identical to the OPD PPO loss so the actor loop needs no changes;
+    ``old_log_prob`` and ``rollout_is_weights`` are accepted but unused in Phase 1.
+
+    Configurable via ``actor_rollout_ref.actor.policy_loss.*``:
+
+    - ``alm_binarization_temp`` (float, default 1.0): divide chunk log-p by this temperature.
+    - ``alm_diff_fn`` (str, default ``binary_ce``): only ``binary_ce`` implemented in Phase 1.
+    - ``alm_numerator`` (str, default ``chunk_count``): per-chunk weight —
+      ``chunk_count``, ``token_count`` or ``log1p_token_count``.
+    - ``alm_denominator`` (str, default ``chunk_count``): only ``chunk_count`` implemented.
+    - ``alm_chunk_clamp`` (Optional[float], default None): clamp chunk log-p to ``[-C, 0]``.
+    """
+    response_length = log_prob.shape[-1]
+    teacher_log_probs, opd_chunk_ids = _unpack_opd_signal(advantages, response_length)
+
+    # Resolve ALM config knobs with defaults so existing configs keep working.
+    T_temp = 1.0
+    diff_fn = "binary_ce"
+    numerator_mode = "chunk_count"
+    denominator_mode = "chunk_count"
+    chunk_clamp: Optional[float] = None
+    pl_cfg = config.get("policy_loss", None) if (config is not None and hasattr(config, "get")) else None
+    if pl_cfg is not None:
+        T_temp = float(pl_cfg.get("alm_binarization_temp", 1.0))
+        diff_fn = str(pl_cfg.get("alm_diff_fn", "binary_ce")).lower()
+        numerator_mode = str(pl_cfg.get("alm_numerator", "chunk_count")).lower()
+        denominator_mode = str(pl_cfg.get("alm_denominator", "chunk_count")).lower()
+        chunk_clamp = pl_cfg.get("alm_chunk_clamp", None)
+    if diff_fn != "binary_ce":
+        raise NotImplementedError(
+            f"alm_diff_fn={diff_fn!r} not implemented; only 'binary_ce' available in Phase 1."
+        )
+    if denominator_mode != "chunk_count":
+        raise NotImplementedError(
+            f"alm_denominator={denominator_mode!r} not implemented; only 'chunk_count' available in Phase 1."
+        )
+    if numerator_mode not in ("chunk_count", "token_count", "log1p_token_count"):
+        raise ValueError(
+            f"Unknown alm_numerator={numerator_mode!r}; "
+            "expected 'chunk_count', 'token_count' or 'log1p_token_count'."
+        )
+
+    # Sentinel: inf teacher log-p (special tokens, unaligned) or -1 chunk id.
+    sentinel_mask = torch.isinf(teacher_log_probs)
+    if opd_chunk_ids is not None:
+        sentinel_mask = sentinel_mask | (opd_chunk_ids < 0)
+    resp_mask_bool = response_mask.bool()
+    valid = resp_mask_bool & ~sentinel_mask  # [B, T]
+
+    alm_inf_tokens = int((sentinel_mask & resp_mask_bool).sum().item())
+    alm_valid_tokens = int(resp_mask_bool.sum().item())
+    alm_inf_ratio = alm_inf_tokens / max(alm_valid_tokens, 1)
+
+    # Zero out sentinel positions before the chunk sum. ``teacher_log_probs`` carries
+    # inf sentinels; ``log_prob`` should already be finite but we zero it too for symmetry.
+    safe_teacher = torch.where(
+        valid, teacher_log_probs, torch.zeros_like(teacher_log_probs)
+    ).detach()
+    safe_student = torch.where(valid, log_prob, torch.zeros_like(log_prob))
+
+    if opd_chunk_ids is None:
+        # Fallback: treat every valid token as its own singleton chunk.
+        # `A` degenerates to a diagonal, so chunk-sum == token-level values.
+        teacher_chunk_logp = safe_teacher
+        student_chunk_logp = safe_student
+        chunk_valid = valid
+        chunk_count = valid.to(safe_student.dtype)
+    else:
+        # ``chunk_ids`` may collide across sequences (chunk 0 of seq A vs chunk 0 of seq B)
+        # but that is fine: einsum sums per-sample along the K dim so cross-seq contributions
+        # never mix.
+        safe_ids = opd_chunk_ids.clamp_min(0)  # -1 → 0, but its row of `A` is zeroed via `valid`.
+        max_id = int(safe_ids.max().item()) if safe_ids.numel() > 0 else 0
+        K = max_id + 1
+        # one_hot returns int64; cast to the student log-prob dtype so grad can flow.
+        A = torch.nn.functional.one_hot(safe_ids, num_classes=K).to(safe_student.dtype)  # [B, T, K]
+        A = A * valid.unsqueeze(-1).to(A.dtype)  # zero sentinel / padded rows
+
+        teacher_chunk_logp = torch.einsum("btk,bt->bk", A, safe_teacher)  # no grad
+        student_chunk_logp = torch.einsum("btk,bt->bk", A, safe_student)  # GRAD flows
+        chunk_count = A.sum(dim=1)  # [B, K], tokens per chunk
+        chunk_valid = chunk_count > 0  # [B, K]
+
+    # Chunk log-p should never be positive; tiny numerical drift is possible.
+    teacher_chunk_logp = teacher_chunk_logp.clamp(max=0.0)
+    student_chunk_logp = student_chunk_logp.clamp(max=0.0)
+    if chunk_clamp is not None:
+        c = float(chunk_clamp)
+        teacher_chunk_logp = teacher_chunk_logp.clamp(min=-c)
+        student_chunk_logp = student_chunk_logp.clamp(min=-c)
+
+    # Binary CE between the two chunk Bernoullis.
+    # Cast to fp32 inside the numerically sensitive block; keep grad on student side.
+    eps = 1e-6
+    log_p_t = (teacher_chunk_logp.to(torch.float32) / T_temp) - eps
+    log_p_s = (student_chunk_logp.to(torch.float32) / T_temp) - eps
+    # Guard against log_p_s hitting 0 exactly (log1mexp(0) is -inf).
+    log_p_s = log_p_s.clamp(max=-eps)
+    log_p_t = log_p_t.clamp(max=-eps)
+
+    p_t = torch.exp(log_p_t)
+    one_minus_p_t = -torch.expm1(log_p_t)  # 1 - exp(log_p_t), stable near 0
+    elem_loss = -(p_t * log_p_s + one_minus_p_t * log1mexp(log_p_s))
+    elem_loss = elem_loss * chunk_valid.to(elem_loss.dtype)
+
+    # Aggregation.
+    if numerator_mode == "chunk_count":
+        numer = chunk_valid.to(elem_loss.dtype)
+    elif numerator_mode == "token_count":
+        numer = chunk_count.to(elem_loss.dtype)
+    else:  # log1p_token_count
+        numer = torch.log1p(chunk_count.to(elem_loss.dtype))
+    denom = chunk_valid.to(elem_loss.dtype).sum().clamp_min(1.0)
+    alm_loss = (elem_loss * numer).sum() / denom
+    # Cast back to student dtype so downstream ops (entropy/KL sum) stay in one dtype.
+    alm_loss = alm_loss.to(log_prob.dtype)
+
+    with torch.no_grad():
+        if chunk_valid.any():
+            teacher_mean_p = teacher_chunk_logp[chunk_valid].mean().item()
+            student_mean_p = student_chunk_logp[chunk_valid].mean().item()
+            teacher_min_p = teacher_chunk_logp[chunk_valid].min().item()
+            student_min_p = student_chunk_logp[chunk_valid].min().item()
+            chunk_count_max = int(chunk_count[chunk_valid].max().item())
+            chunk_count_mean = float(chunk_count[chunk_valid].float().mean().item())
+        else:
+            teacher_mean_p = 0.0
+            student_mean_p = 0.0
+            teacher_min_p = 0.0
+            student_min_p = 0.0
+            chunk_count_max = 0
+            chunk_count_mean = 0.0
+
+    metrics = {
+        "actor/alm_loss": alm_loss.detach().item(),
+        "actor/alm_valid_chunks": int(chunk_valid.sum().item()),
+        "actor/alm_sentinel_ratio": alm_inf_ratio,
+        "actor/alm_teacher_mean_logp": teacher_mean_p,
+        "actor/alm_student_mean_logp": student_mean_p,
+        "actor/alm_teacher_min_logp": teacher_min_p,
+        "actor/alm_student_min_logp": student_min_p,
+        "actor/alm_chunk_size_max": chunk_count_max,
+        "actor/alm_chunk_size_mean": chunk_count_mean,
+    }
+    return alm_loss, metrics
 
 
 @register_policy_loss("gspo")

@@ -42,6 +42,8 @@ def main():
     parser.add_argument("--distributed-executor-backend", type=str, default=None,
                         choices=["ray", "mp", "external_launcher", None],
                         help="vLLM distributed executor backend for multi-node.")
+    parser.add_argument("--vllm-server-url", type=str, default="http://localhost:8000",
+                        help="URL of the vLLM OpenAI-compatible server (for vllm_http backend).")
     args = parser.parse_args()
 
     if args.backend == "vllm":
@@ -57,6 +59,14 @@ def main():
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_model_len=args.max_model_len,
             distributed_executor_backend=args.distributed_executor_backend,
+        )
+    elif args.backend == "vllm_http":
+        from vllm_http_engine import VLLMHTTPEngine
+
+        engine = VLLMHTTPEngine(
+            server_url=args.vllm_server_url,
+            model_name=args.ckpt_path,
+            n_logprobs=args.n_logprobs,
         )
     else:
         raise ValueError(f"Unknown backend: {args.backend}.")

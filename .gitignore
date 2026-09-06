@@ -80,6 +80,7 @@ dmypy.json
 .local_backup/
 
 # Checkpoint / eval / inference dumps
+archive/
 ckpts/
 dumps/
 inf_dumps/
@@ -119,6 +120,7 @@ nohup.out
 verify_nfc_fix.py
 
 # PDFs / large binary attachments
+On-Policy-Distill.tar.gz
 *.pdf
 NeurIPS_*.pdf
 
@@ -173,8 +175,11 @@ evaluation/
 # start_server_qwen3_8b.sh which is the one currently in use — but we keep
 # it out of git for now while the runbook is being rewritten)
 recipe/gkd/teacher/start_server_deepseek_r1.sh
+recipe/gkd/teacher/start_server_deepseek_r1_http.sh
 recipe/gkd/teacher/start_server_ds_distill_llama70b.sh
+recipe/gkd/teacher/start_server_justrl_qwen7b.sh
 recipe/gkd/teacher/start_server_llama70b.sh
+recipe/gkd/teacher/start_just_rl.sh
 recipe/gkd/teacher/start_server_qwen3_8b.sh
 recipe/gkd/teacher/start_server_qwen3_8b_multi.sh
 recipe/gkd/teacher/start_server_r1.sh

@@ -71,3 +71,129 @@ dmypy.json
 
 # profiling data
 .prof
+
+# ============================================================================
+# Project-local: work artifacts, dumps, private notes, secrets
+# ============================================================================
+
+# Local backups of runnable scripts (not versioned)
+.local_backup/
+
+# Checkpoint / eval / inference dumps
+ckpts/
+dumps/
+inf_dumps/
+tmp/
+work_log/
+
+# Handoff / private planning docs (rolling internal state, not for git)
+HANDOFF*.md
+TODO.md
+RESULTS_CHECK_LIST.md
+experiment_plan*.md
+DEEPSEEK_*.md
+DEEPSEEK_*.txt
+ALM_INTEGRATION_PLAN.md
+EXPLORATION_SUMMARY.md
+OPD_rebuttal.md
+paper_figure_example.md
+paper_final_examples.json
+paper_mismatch_examples.json
+OPD_CROSS_TOKENIZER_ANALYSIS.md
+DCTV_OPD_method.md
+CLUSTER_QUICKSTART.md
+unicode_mismatch_analysis.md
+nfc_fix_report.txt
+
+# Ad-hoc launch/eval scripts + logs
+launch_eval.sh
+cross_distill_*.sh
+occupy.py
+occupy.sh
+enable_internet_proxy.sh
+signadv_run*.log
+eval_log_*.log
+eval_results_*.json
+eval_deepmath_*.json
+nohup.out
+verify_nfc_fix.py
+
+# PDFs / large binary attachments
+*.pdf
+NeurIPS_*.pdf
+
+# Node-local fleet layout (contains cluster IPs)
+train_script/fleet.txt
+
+# Legacy / superseded train scripts (kept locally, not versioned — many still
+# contain absolute cephfs paths, old wandb keys, or cluster-specific hostnames)
+train_script/ds_ds_dapo_magnitude_exp.sh
+train_script/ds_ds_dapo_phase2_exp.sh
+train_script/ds_ds_dapo_tv_sched_exp.sh
+train_script/ds_ds_dapo_tv_sched_exp.smoke.sh
+train_script/ds_ds_dapo_tv_sched_scaleA_exp.sh
+train_script/ds_ds_distill_llama_code_science.sh
+train_script/ds_ds_distill_llama_dapo_math.sh
+train_script/ds_ds_distill_llama_math.sh
+train_script/ds_ds_distill_qwen_code_science.sh
+train_script/ds_ds_distill_qwen_math.sh
+train_script/gold_ds_zero3.json
+train_script/justrl_qwen7b_ds_llama.sh
+train_script/launch_ds_ds_dapo_all.sh
+train_script/launch_ds_ds_dapo_phase2.sh
+train_script/launch_ds_ds_dapo_replicates.sh
+train_script/launch_ds_ds_dapo_tv_sched.sh
+train_script/launch_ds_ds_dapo_tv_sched_scaleA.sh
+train_script/launch_magnitude_exp_12nodes.sh
+train_script/launch_magnitude_exp_all.sh
+train_script/launch_qwen_qwen_deepmath_tv_sched.sh
+train_script/launch_qwen_qwen_rawadv.sh
+train_script/prepare_gold_data.py
+train_script/prewarm_models.sh
+train_script/qwen_llama_code_science.sh
+train_script/qwen_llama_math.sh
+train_script/qwen_qwen_code_science.sh
+train_script/qwen_qwen_deepmath_tv_sched_exp.sh
+train_script/qwen_qwen_deepmath_tv_sched_scaleA_exp.sh
+train_script/qwen_qwen_math.sh
+train_script/qwen_qwen_math_magnitude_exp.sh
+train_script/qwen_qwen_rawadv_exp.sh
+train_script/run_gold.py
+train_script/run_gold.sh
+train_script/run_opd.sh
+train_script/tokenizer_comparison.md
+
+# Stale eval + inference helpers
+OPD_README.md
+eval_deepmath_inference.py
+eval_deepmath_score.py
+evaluation/
+
+# Stale teacher-side start scripts (hardcoded paths, superseded by
+# start_server_qwen3_8b.sh which is the one currently in use — but we keep
+# it out of git for now while the runbook is being rewritten)
+recipe/gkd/teacher/start_server_deepseek_r1.sh
+recipe/gkd/teacher/start_server_ds_distill_llama70b.sh
+recipe/gkd/teacher/start_server_llama70b.sh
+recipe/gkd/teacher/start_server_qwen3_8b.sh
+recipe/gkd/teacher/start_server_qwen3_8b_multi.sh
+recipe/gkd/teacher/start_server_r1.sh
+recipe/gkd/teacher/README_multi_server.md
+
+# Ad-hoc top-level scripts / tests
+test_teacher_service.py
+scripts/compute_student_logps.py
+scripts/find_chunk_examples.py
+tests/dpca_sanity_compare_teachers.py
+tests/gpqa_sanity_eval.py
+tests/test_opd_teacher_client.py
+
+# Teacher server dev logs
+recipe/gkd/teacher/*.log
+recipe/gkd/teacher/*.log.bak_*
+recipe/gkd/teacher/proxy.log.bak_*
+recipe/gkd/teacher/worker.log
+
+# Editor / tooling caches
+.claude/
+.gold_venv/

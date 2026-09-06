@@ -74,6 +74,11 @@ actor_rollout_ref:
       opd_dctv_beta_m: 0.95
       opd_dctv_eps: 1.0e-8
       opd_dctv_c_cap: 1.0
+      opd_tv_sched_enabled: false
+      opd_tv_sched_beta: 0.95
+      opd_tv_sched_alpha: 1.0
+      opd_tv_sched_c_min: 0.1
+      opd_tv_sched_target: lr
       alm_binarization_temp: 1.0
       alm_diff_fn: binary_ce
       alm_numerator: chunk_count

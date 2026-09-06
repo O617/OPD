@@ -1,0 +1,13 @@
+# Fleet layout for launch_qwen_qwen_rawadv_b200.sh
+# Copy to fleet.txt and edit for your cluster. Fields per line:
+#
+#   <host_or_ip>   <label>    <dataset>   <seed>
+#
+# dataset ∈ {deepmath, dapo}
+# Blank lines and lines starting with # are ignored.
+#
+# Example (4-node fleet):
+# 10.0.0.1  launcher deepmath 42
+# 10.0.0.2  worker-0 deepmath 63
+# 10.0.0.3  worker-1 dapo     42
+# 10.0.0.4  worker-2 dapo     63

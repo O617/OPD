@@ -108,6 +108,26 @@ class DataParallelPPOActor(BasePPOActor):
             "step": 0,
         }
 
+        # TV-guided LR scheduler state (independent of DCTV; heuristic
+        # multiplicative annealing of the optimizer LR by
+        #   c_t = clip((D̄_{t-1} + ε) / (D_ref + ε))^α, c_min, 1.0)
+        # where D̄_t is a β-EMA of D̂_t and D_ref is captured at the first valid
+        # step so c_0 = 1). Reuses the same per-microbatch D̂ estimator emitted
+        # by ``compute_policy_loss_opd`` (see ``opd_dctv_D_sum/D_count``); the
+        # scheduler does NOT require opd_adv_mode=dctv and in fact rejects it
+        # (mutually exclusive — both scale globally).
+        #   c        -- multiplier applied to optimizer LR at this and
+        #                subsequent optimizer steps; deterministic on all ranks.
+        #   D_ema    -- β-EMA of D̂_t. ``None`` until first valid step.
+        #   D_ref    -- Baseline D̄ captured at first valid step; frozen after.
+        #   step     -- Count of scheduler optimizer steps (for debug).
+        self._tv_sched_state = {
+            "c": 1.0,
+            "D_ema": None,
+            "D_ref": None,
+            "step": 0,
+        }
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -439,6 +459,36 @@ class DataParallelPPOActor(BasePPOActor):
                     "contaminate grad_norm. Set entropy_coeff=0 or pick another mode."
                 )
 
+        # ---- TV-guided LR scheduler sanity check ----
+        # Reuses the D̂ estimator emitted by compute_policy_loss_opd (loss_mode
+        # == "opd") for all opd_adv_mode values including 'sign'. Rejects DCTV
+        # concurrently since both would multiplicatively scale the update.
+        tv_sched_enabled = bool(pl_cfg.get("opd_tv_sched_enabled", False))
+        tv_sched_active = tv_sched_enabled and loss_mode == "opd"
+        if tv_sched_enabled and loss_mode != "opd":
+            raise ValueError(
+                f"opd_tv_sched_enabled=True requires policy_loss.loss_mode='opd' "
+                f"(got '{loss_mode}'). The scheduler consumes D̂ from the OPD loss."
+            )
+        if tv_sched_active and dctv_active:
+            raise ValueError(
+                "opd_tv_sched_enabled=True is mutually exclusive with "
+                "opd_adv_mode='dctv': both introduce a multiplicative global "
+                "step scaling and stacking them is not defined."
+            )
+
+        # TV-scheduler target: 'lr' scales optimizer LR by c_t (c enters after
+        # Adam's m/v normalization → directly multiplies Δθ). 'adv' scales the
+        # policy-loss coefficient by c_t (c enters before Adam → g_t, m, v all
+        # carry c; Adam's √v largely cancels c). Kept as a config knob so we
+        # can sweep both semantics and disentangle the trust-ratio effect from
+        # Adam-normalization effects. Anything else is a config error.
+        _tv_sched_target = str(pl_cfg.get("opd_tv_sched_target", "lr"))
+        if tv_sched_active and _tv_sched_target not in ("lr", "adv"):
+            raise ValueError(
+                f"opd_tv_sched_target must be 'lr' or 'adv' (got {_tv_sched_target!r})"
+            )
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -465,6 +515,13 @@ class DataParallelPPOActor(BasePPOActor):
                 # happens after the loop, before EMA update.
                 _dctv_D_sum_local = 0.0
                 _dctv_D_count_local = 0
+
+                # TV-scheduler per-mini-batch D̂ accumulator. Same estimator
+                # source as DCTV (emitted unconditionally by
+                # compute_policy_loss_opd whenever _n_eff > 0); we keep a
+                # separate pair so a single active mode is unambiguous.
+                _tv_sched_D_sum_local = 0.0
+                _tv_sched_D_count_local = 0
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -533,12 +590,27 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batch_metrics.update(pg_metrics)
 
+                    # TV-scheduler (target='adv'): multiply the policy-loss
+                    # coefficient by c_t on EVERY micro-batch of this optimizer
+                    # step. Uses self._tv_sched_state["c"] (past-conditioned:
+                    # frozen before the step, updated after). This is the
+                    # advantage-scale variant — the c factor propagates into
+                    # g_t, m_t, v_t so Adam's √v̂ largely cancels it. The
+                    # target='lr' branch below leaves pg_loss untouched and
+                    # scales optimizer.param_groups[i]['lr'] instead.
+                    if tv_sched_active and _tv_sched_target == "adv":
+                        pg_loss = pg_loss * float(self._tv_sched_state["c"])
+
                     # Accumulate DCTV D̂ (sum + count on eff_mask, this rank) so
                     # we can DP-reduce a mini-batch-mean D̂ after the optimizer
                     # step. pg_metrics carries per-microbatch scalars already.
                     if dctv_active:
                         _dctv_D_sum_local += float(pg_metrics.get("actor/opd_dctv_D_sum", 0.0))
                         _dctv_D_count_local += int(pg_metrics.get("actor/opd_dctv_D_count", 0))
+
+                    if tv_sched_active:
+                        _tv_sched_D_sum_local += float(pg_metrics.get("actor/opd_dctv_D_sum", 0.0))
+                        _tv_sched_D_count_local += int(pg_metrics.get("actor/opd_dctv_D_count", 0))
 
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
@@ -587,7 +659,28 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
+                # TV-scheduler (target='lr'): scale LR down by c_used for
+                # this optimizer step, then restore. Scaling the LR (not the
+                # advantage) puts c AFTER Adam's per-parameter normalization,
+                # i.e. it multiplies m̂ / (√v̂ + ε) without changing the
+                # running moment estimates. target='adv' takes the other
+                # branch: c is already multiplied into pg_loss above, so LR
+                # here is left untouched.
+                _tv_sched_base_lrs: list[float] = []
+                _tv_sched_c_used = float(self._tv_sched_state["c"])
+                if tv_sched_active and _tv_sched_target == "lr":
+                    _tv_sched_base_lrs = [
+                        float(group["lr"]) for group in self.actor_optimizer.param_groups
+                    ]
+                    for group, lr in zip(self.actor_optimizer.param_groups, _tv_sched_base_lrs):
+                        group["lr"] = lr * _tv_sched_c_used
+
                 grad_norm = self._optimizer_step()
+
+                if tv_sched_active and _tv_sched_target == "lr":
+                    for group, lr in zip(self.actor_optimizer.param_groups, _tv_sched_base_lrs):
+                        group["lr"] = lr
+
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
 
                 # ---- DCTV controller update (once per optimizer step) ----
@@ -686,6 +779,105 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/opd_dctv_lr": _lr,
                         "actor/opd_dctv_step": int(self._dctv_state["step"]),
                         "actor/opd_dctv_nonfinite_grad_norm": _nonfinite_flag,
+                    })
+
+                # ---- TV-scheduler controller update (once per optimizer step) ----
+                # Past-conditioned by design: this step consumed c=self._tv_sched_state["c"];
+                # after this step we compute D̂_t → D̄_t → c_{t+1} for the next
+                # optimizer step. On non-finite grad_norm we freeze the state
+                # (skip both D_ref bootstrap and EMA update) to mirror the
+                # optimizer's skip-update path in _optimizer_step().
+                if tv_sched_active:
+                    _sched_reduce_buf = torch.tensor(
+                        [_tv_sched_D_sum_local, float(_tv_sched_D_count_local)],
+                        dtype=torch.float64,
+                        device=get_device_id(),
+                    )
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            _sched_reduce_buf, op=torch.distributed.ReduceOp.SUM
+                        )
+                    _sched_D_sum = _sched_reduce_buf[0].item()
+                    _sched_D_count = _sched_reduce_buf[1].item()
+                    _sched_D_hat = _sched_D_sum / max(_sched_D_count, 1.0)
+
+                    _sched_grad_finite = bool(torch.isfinite(grad_norm).item())
+                    # lr_base / lr_effective semantics:
+                    #   target='lr': _tv_sched_base_lrs was populated pre-step;
+                    #     lr_effective = lr_base · c_used (what actually ran).
+                    #   target='adv': we didn't touch the optimizer LR, so
+                    #     lr_base is the untouched lr and lr_effective ≡ lr_base.
+                    #     The c factor lived in pg_loss, not lr; wandb consumers
+                    #     should read opd_tv_sched_c_used + target when reading
+                    #     these two columns for the adv variant.
+                    _sched_lr_base = (
+                        float(_tv_sched_base_lrs[0])
+                        if _tv_sched_base_lrs
+                        else float(self.actor_optimizer.param_groups[0]["lr"])
+                    )
+                    if _tv_sched_target == "lr":
+                        _sched_lr_effective = _sched_lr_base * _tv_sched_c_used
+                    else:
+                        _sched_lr_effective = _sched_lr_base
+
+                    _sched_beta = float(pl_cfg.get("opd_tv_sched_beta", 0.95))
+                    _sched_alpha = float(pl_cfg.get("opd_tv_sched_alpha", 1.0))
+                    _sched_c_min = float(pl_cfg.get("opd_tv_sched_c_min", 0.1))
+                    _sched_eps = 1e-8
+
+                    _sched_c_next = float(self._tv_sched_state["c"])
+                    _sched_ratio = float("nan")
+                    _sched_nonfinite_flag = 0
+                    if _sched_grad_finite:
+                        st = self._tv_sched_state
+                        st["D_ema"] = (
+                            _sched_D_hat
+                            if st["D_ema"] is None
+                            else _sched_beta * st["D_ema"] + (1.0 - _sched_beta) * _sched_D_hat
+                        )
+                        if st["D_ref"] is None:
+                            # Anchor at the first valid step so c_0 = 1 exactly.
+                            st["D_ref"] = float(st["D_ema"])
+                        st["step"] += 1
+
+                        _sched_ratio = (
+                            (st["D_ema"] + _sched_eps) / (st["D_ref"] + _sched_eps)
+                        )
+                        _sched_c_next = _sched_ratio ** _sched_alpha
+                        _sched_c_next = min(1.0, max(_sched_c_min, _sched_c_next))
+                        st["c"] = _sched_c_next
+                    else:
+                        _sched_nonfinite_flag = 1
+
+                    mini_batch_metrics.update({
+                        "actor/opd_tv_sched_D_hat": _sched_D_hat,
+                        "actor/opd_tv_sched_D_count": int(_sched_D_count),
+                        "actor/opd_tv_sched_D_ema": (
+                            float(self._tv_sched_state["D_ema"])
+                            if self._tv_sched_state["D_ema"] is not None
+                            else 0.0
+                        ),
+                        "actor/opd_tv_sched_D_ref": (
+                            float(self._tv_sched_state["D_ref"])
+                            if self._tv_sched_state["D_ref"] is not None
+                            else 0.0
+                        ),
+                        "actor/opd_tv_sched_D_ratio": float(_sched_ratio),
+                        "actor/opd_tv_sched_c_used": float(_tv_sched_c_used),
+                        "actor/opd_tv_sched_c_next": float(_sched_c_next),
+                        "actor/opd_tv_sched_lr_base": _sched_lr_base,
+                        "actor/opd_tv_sched_lr_effective": _sched_lr_effective,
+                        "actor/opd_tv_sched_step": int(self._tv_sched_state["step"]),
+                        "actor/opd_tv_sched_nonfinite_grad_norm": _sched_nonfinite_flag,
+                        # Hparam echoes (constant per run) for wandb sanity.
+                        "actor/opd_tv_sched_alpha": _sched_alpha,
+                        "actor/opd_tv_sched_beta": _sched_beta,
+                        "actor/opd_tv_sched_c_min": _sched_c_min,
+                        # target='lr' → 0, target='adv' → 1. Simple int so wandb
+                        # can group and split lines by scheduler semantics.
+                        "actor/opd_tv_sched_target_is_adv": (
+                            1 if _tv_sched_target == "adv" else 0
+                        ),
                     })
 
                 append_to_dict(metrics, mini_batch_metrics)

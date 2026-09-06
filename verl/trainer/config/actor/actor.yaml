@@ -132,6 +132,35 @@ policy_loss:
   # natural "don't first-order overshoot pure TV" cap. Values >1 are escape-hatch.
   opd_dctv_c_cap: 1.0
 
+  # TV-guided LR scheduler (heuristic, independent of opd_adv_mode). When
+  # enabled, each optimizer step's effective LR is
+  #   η_eff = c_t · η_base,   c_t = clip((D̄_{t-1}+ε)/(D_ref+ε))^α, c_min, 1.0)
+  # where D̄_t = β·D̄_{t-1} + (1-β)·D̂_t reuses the OPD D̂ estimator (mean of
+  # [1-exp(Δ)]_+ on eff_mask, DP-reduced). D_ref is captured at the first valid
+  # optimizer step so c_0 = 1. Mutually exclusive with opd_adv_mode=dctv (both
+  # rescale globally). Default off.
+  opd_tv_sched_enabled: False
+
+  # TV-scheduler EMA smoothing on D̂_t. Estimator constant, not a method hparam.
+  opd_tv_sched_beta: 0.95
+
+  # TV-scheduler annealing exponent α ≥ 0. α=0 ⇔ constant c=1 (equivalent to
+  # pure sign baseline); α=1 ⇔ TV-proportional; larger α anneals more
+  # aggressively. This is the hparam to sweep.
+  opd_tv_sched_alpha: 1.0
+
+  # TV-scheduler floor on c_t (engineering safety cap against LR collapse).
+  opd_tv_sched_c_min: 0.1
+
+  # TV-scheduler target: 'lr' (default) multiplies optimizer LR by c_t so c
+  # enters AFTER Adam's m/v normalization (directly scales Δθ). 'adv' scales
+  # the policy-loss coefficient by c_t so c enters BEFORE Adam → g_t, m, v all
+  # carry a factor of c; Adam's √v then largely cancels c. Two very different
+  # Adam-interaction semantics; sweep both to disentangle the trust-ratio
+  # effect from Adam-normalization effects. Ignored unless
+  # opd_tv_sched_enabled=True.
+  opd_tv_sched_target: lr
+
   # For ALM loss only. Divide chunk log-p by this temperature before the Bernoulli BCE.
   alm_binarization_temp: 1.0
 

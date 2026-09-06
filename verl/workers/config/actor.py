@@ -112,6 +112,32 @@ class PolicyLossConfig(BaseConfig):
             "don't overshoot pure-TV" cap). Values > 1 allow the controller to
             *amplify* pure-TV when the estimator predicts under-shoot; > 1 is
             escape-hatch only and not the default.
+        opd_tv_sched_enabled (bool): TV-guided LR scheduler switch. When True,
+            each optimizer step's effective LR is η_eff = c_t · η_base where
+            c_t = clip((D̄_{t-1}+ε)/(D_ref+ε))^α, c_min, 1.0). D_ref is captured
+            once, at the first optimizer step, so c_0 = 1 (no annealing at start).
+            Independent of ``opd_adv_mode`` and mutually exclusive with
+            ``opd_adv_mode='dctv'`` (both scale globally). Default False.
+        opd_tv_sched_beta (float): TV-scheduler EMA smoothing on D̂_t.
+            Estimator smoothing constant, not a method hparam. Default 0.95.
+            Ignored unless ``opd_tv_sched_enabled=True``.
+        opd_tv_sched_alpha (float): TV-scheduler annealing exponent α ≥ 0.
+            α=0 ⇔ constant c=1 (no annealing); α=1 ⇔ TV-proportional
+            (c = D̄/D_ref); larger α anneals more aggressively. This is the
+            hparam to sweep. Default 1.0.
+        opd_tv_sched_c_min (float): TV-scheduler floor on c_t, an engineering
+            safety cap to prevent LR from collapsing to zero on estimator
+            fluctuation. Default 0.1. Ignored unless
+            ``opd_tv_sched_enabled=True``.
+        opd_tv_sched_target (str): TV-scheduler target — what c_t multiplies.
+            'lr' (default): scale optimizer LR by c_t (c enters AFTER Adam's
+            m/v normalization → directly multiplies Δθ). 'adv': scale the
+            policy-loss coefficient by c_t (c enters BEFORE Adam → g_t, m,
+            v all scaled by c → Adam largely cancels c through √v; c mainly
+            leaves a bias on the m/v time series). Different Adam-interaction
+            semantics; sweep both to disentangle the trust-ratio effect from
+            "Adam normalization" effects. Ignored unless
+            ``opd_tv_sched_enabled=True``.
         alm_binarization_temp (float): For ALM loss only. Divide chunk log-p by this temperature
             before the Bernoulli BCE. Default 1.0.
         alm_diff_fn (str): For ALM loss only. Elementwise divergence between chunk Bernoullis.
@@ -139,6 +165,11 @@ class PolicyLossConfig(BaseConfig):
     opd_dctv_beta_m: float = 0.95
     opd_dctv_eps: float = 1e-8
     opd_dctv_c_cap: float = 1.0
+    opd_tv_sched_enabled: bool = False
+    opd_tv_sched_beta: float = 0.95
+    opd_tv_sched_alpha: float = 1.0
+    opd_tv_sched_c_min: float = 0.1
+    opd_tv_sched_target: str = "lr"
     alm_binarization_temp: float = 1.0
     alm_diff_fn: str = "binary_ce"
     alm_numerator: str = "chunk_count"

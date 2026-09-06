@@ -171,19 +171,6 @@ next-round sweeps.
 
 ---
 
-## Val setup
-
-`test_freq=25` runs the val loop over `aime24 + aime25` every 25 optimizer
-steps with `val_kwargs.n=4` samples per prompt at temperature 0.6, top-p
-0.95, max 31744 tokens. `val_before_train=True` in tune5 records a step-0
-baseline.
-
-At step 0 (Qwen3-8B student, tune5, DeepMath seed=42):
-- aime24 maj@4 = 0.6156
-- aime25 maj@4 = 0.5316
-
----
-
 ## Verl / upstream
 
 The upstream verl README is at [`docs/`](docs/) and on

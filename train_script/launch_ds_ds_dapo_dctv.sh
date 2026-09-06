@@ -20,10 +20,10 @@
 # ============================================================================
 set -euo pipefail
 
-CLUSTER_PREFIX="$CLUSTER_PREFIX"
-REPO_ROOT="$DATA_ROOT/develop/OPD"
+: "${CLUSTER_PREFIX:?CLUSTER_PREFIX must be set (SSH hostname prefix, e.g. \"ts-abc123-\") — leave empty string if hosts have no prefix}"
+: "${REPO_ROOT:?REPO_ROOT must be set (absolute repo path on remote hosts)}"
 SCRIPT="${REPO_ROOT}/train_script/ds_ds_dapo_dctv_exp.sh"
-LOG_DIR="${REPO_ROOT}/train_script/outputs/ds_ds_dapo_dctv_$(date +%Y%m%d_%H%M)"
+LOG_DIR="${LOG_DIR:-${REPO_ROOT}/train_script/outputs/ds_ds_dapo_dctv_$(date +%Y%m%d_%H%M)}"
 
 # (node-short, seed) tuples. Adjust node-shorts to whichever slots are free
 # when you launch. Seeds fixed at the canonical 4 (42, 63, 7, 21).

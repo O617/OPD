@@ -14,6 +14,7 @@
 # Required env:
 #   WANDB_API_KEY       — wandb login token (propagated to remotes)
 #   TEACHER_SERVER_IP   — remote teacher server IP
+#   TEACHER_CKPT_PATH   — teacher tokenizer/ckpt path (must be visible to students)
 #   DATA_ROOT           — dir on each student containing *_messages.parquet
 #   MODEL_PATH          — student init ckpt path on each student
 #
@@ -43,6 +44,7 @@ set -euo pipefail
 
 : "${WANDB_API_KEY:?WANDB_API_KEY must be exported before launching}"
 : "${TEACHER_SERVER_IP:?TEACHER_SERVER_IP must be exported before launching}"
+: "${TEACHER_CKPT_PATH:?TEACHER_CKPT_PATH must be exported before launching}"
 : "${DATA_ROOT:?DATA_ROOT must be exported before launching}"
 : "${MODEL_PATH:?MODEL_PATH must be exported before launching}"
 
@@ -119,6 +121,7 @@ launch_students() {
             export TEACHER_SERVER_IP=${TEACHER_IP}
             export TEACHER_SERVER_PORT=${TEACHER_PORT}
             export TEACHER_N_WORKERS=${TEACHER_WORKERS}
+            export TEACHER_CKPT_PATH=${TEACHER_CKPT_PATH}
             export SP_SIZE=${SP_SIZE}
             export FSDP_SIZE=${FSDP_SIZE}
             export GEN_TP=${GEN_TP}

@@ -15,20 +15,26 @@
 # ============================================================================
 set -euo pipefail
 
-CLUSTER_PREFIX="$CLUSTER_PREFIX"
-SRC="$DATA_ROOT/DS-Distill-Qwen-1.5B"
-DST="/root/DS-Distill-Qwen-1.5B"
+: "${CLUSTER_PREFIX?CLUSTER_PREFIX must be set (SSH host prefix, appended with \"-launcher\"/\"-worker-N\") — empty string if hosts have no prefix}"
+: "${SRC:?SRC must be set (shared-fs path to DS-Distill-Qwen-1.5B)}"
+DST="${DST:-/root/DS-Distill-Qwen-1.5B}"
 
-ALL_NODES=(
-    "${CLUSTER_PREFIX}-launcher"
-    "${CLUSTER_PREFIX}-worker-0"
-    "${CLUSTER_PREFIX}-worker-1"
-    "${CLUSTER_PREFIX}-worker-2"
-    "${CLUSTER_PREFIX}-worker-3"
-    "${CLUSTER_PREFIX}-worker-4"
-    "${CLUSTER_PREFIX}-worker-5"
-    "${CLUSTER_PREFIX}-worker-6"
-)
+# Node list. Override by exporting NODES="host1 host2 host3 ..." — otherwise
+# defaults to a launcher + 7 workers under CLUSTER_PREFIX.
+if [[ -n "${NODES:-}" ]]; then
+    read -r -a ALL_NODES <<<"${NODES}"
+else
+    ALL_NODES=(
+        "${CLUSTER_PREFIX}-launcher"
+        "${CLUSTER_PREFIX}-worker-0"
+        "${CLUSTER_PREFIX}-worker-1"
+        "${CLUSTER_PREFIX}-worker-2"
+        "${CLUSTER_PREFIX}-worker-3"
+        "${CLUSTER_PREFIX}-worker-4"
+        "${CLUSTER_PREFIX}-worker-5"
+        "${CLUSTER_PREFIX}-worker-6"
+    )
+fi
 
 MODE="ensure"
 case "${1:-}" in

@@ -4,7 +4,7 @@
 # Distance-Calibrated TVOPD)
 # ----------------------------------------------------------------------------
 # Teacher : JustRL-DeepSeek-1.5B (Qwen2ForCausalLM, GRPO-trained), served at
-#           <REDACTED_IP>:15555 (ZMQ, --n-logprobs 1, tp=2, 4 workers)
+#           TEACHER_SERVER_IP:TEACHER_SERVER_PORT (ZMQ, --n-logprobs 1, tp=2, 4 workers)
 # Student : DeepSeek-R1-Distill-Qwen-1.5B (Qwen2ForCausalLM)
 # Train   : DAPO-17k (dapo-math-17k.parquet)
 # Eval    : AIME24 + AIME25 (n=4 each)
@@ -33,40 +33,61 @@
 set -xeuo pipefail
 
 # ---- Activate venv (editable-linked to this repo) ----
-source $DATA_ROOT/develop/OPD/.venv/bin/activate
+REPO_ROOT=${REPO_ROOT:-"$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)"}
+VENV_DIR=${VENV_DIR:-"${REPO_ROOT}/.venv"}
+# Direct PATH export instead of `source activate` — the activate script hard-codes
+# VIRTUAL_ENV and breaks if the venv has been moved between clusters.
+export VIRTUAL_ENV="${VENV_DIR}"
+export PATH="${VENV_DIR}/bin:${PATH}"
+hash -r
 
 # ---- ulimit for RDMA & Ray raylet ----
 ulimit -l unlimited
 ulimit -n 65536
 
 # ---- NCCL InfiniBand / RoCE configuration ----
+# HCA / ifname defaults assume a cluster exposing aggregated `mlx5_bond_*`
+# devices behind `bond1`. Override NCCL_IB_HCA / NCCL_SOCKET_IFNAME (and
+# related NVSHMEM_* vars) for clusters exposing per-GPU HCAs (e.g. ibpXXsY)
+# or a different ethernet iface.
 export NCCL_IB_TC=160
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_IB_HCA=mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7,mlx5_bond_8
+export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7,mlx5_bond_8}
 export NCCL_IB_TIMEOUT=22
 export NCCL_IB_SL=3
-export NCCL_SOCKET_IFNAME=bond1
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-bond1}
 export NCCL_DMABUF_ENABLE=0
 export NCCL_NET_GDR_LEVEL=LOC
-export UCX_NET_DEVICES=bond1
-export GLOO_SOCKET_IFNAME=bond1
-export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond1
-export NVSHMEM_HCA_LIST=mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-bond1}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-bond1}
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-bond1}
+export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1}
 export NVSHMEM_IB_TRAFFIC_CLASS=160
 export NVSHMEM_IB_TIMEOUT=22
-export NCCL_DEBUG=INFO
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
 
 # vllm+flashinfer version mismatch bypass
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
-# wandb via $HTTP_PROXY_HOST; NO_PROXY keeps teacher/Ray traffic direct.
-export HTTPS_PROXY=http://$HTTP_PROXY_URL
-export HTTP_PROXY=http://$HTTP_PROXY_URL
-export https_proxy=http://$HTTP_PROXY_URL
-export http_proxy=http://$HTTP_PROXY_URL
-export NO_PROXY=localhost,127.0.0.1,$PROXY_BYPASS_DOMAIN,<REDACTED_IP>,<REDACTED_IP>,<REDACTED_IP>/24,<REDACTED_IP>/24,<REDACTED_IP>/16
-export no_proxy=$NO_PROXY
+# Optional HTTP proxy (set HTTP_PROXY_URL to enable). Teacher IP + any
+# intra-cluster hosts must land in NO_PROXY, else ZMQ REQ goes through the
+# proxy and hangs.
+if [[ -n "${HTTP_PROXY_URL:-}" ]]; then
+    export HTTPS_PROXY="${HTTP_PROXY_URL}"
+    export HTTP_PROXY="${HTTP_PROXY_URL}"
+    export https_proxy="${HTTP_PROXY_URL}"
+    export http_proxy="${HTTP_PROXY_URL}"
+fi
+_default_no_proxy="localhost,127.0.0.1"
+if [[ -n "${TEACHER_SERVER_IP:-}" ]]; then
+    _default_no_proxy+=",${TEACHER_SERVER_IP}"
+fi
+if [[ -n "${NO_PROXY_EXTRA:-}" ]]; then
+    _default_no_proxy+=",${NO_PROXY_EXTRA}"
+fi
+export NO_PROXY="${NO_PROXY:-${_default_no_proxy}}"
+export no_proxy="${NO_PROXY}"
 
 export WANDB_MODE=online
 export WANDB_INIT_TIMEOUT=${WANDB_INIT_TIMEOUT:-300}
@@ -128,31 +149,38 @@ if ! ray status --address="${RAY_ADDRESS}" >/dev/null 2>&1; then
     }
 fi
 
-# Paths
-RAY_DATA_HOME="$DATA_ROOT/develop/OPD"
+# Paths (all required — no cluster-specific defaults)
+: "${REPO_ROOT:?REPO_ROOT must be set (repo root, used for ckpts)}"
+: "${DATA_ROOT:?DATA_ROOT must be set (contains DAPO-17k parquet + val_all/)}"
+: "${TEACHER_SERVER_IP:?TEACHER_SERVER_IP must be set}"
+: "${TEACHER_CKPT_PATH:?TEACHER_CKPT_PATH must be set (student tokenizer path for retokenize check)}"
 
-# Student: DS-Distill-Qwen-1.5B (Qwen2ForCausalLM), prewarmed to /root/ per node
-# via train_script/prewarm_ds_distill_qwen15b.sh. Falls back to shared FS.
-if [[ -d "/root/DS-Distill-Qwen-1.5B" ]]; then
-    MODEL_PATH="/root/DS-Distill-Qwen-1.5B"
-else
-    echo "WARN: /root/DS-Distill-Qwen-1.5B missing on this node; using shared FS (slow)" >&2
-    MODEL_PATH="$DATA_ROOT/DS-Distill-Qwen-1.5B"
+RAY_DATA_HOME="${REPO_ROOT}"
+
+# Student: DS-Distill-Qwen-1.5B (Qwen2ForCausalLM). If prewarmed to /root/,
+# use the local copy; otherwise expect MODEL_PATH to be set explicitly.
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    if [[ -d "/root/DS-Distill-Qwen-1.5B" ]]; then
+        MODEL_PATH="/root/DS-Distill-Qwen-1.5B"
+    else
+        echo "ERROR: MODEL_PATH not set and /root/DS-Distill-Qwen-1.5B missing" >&2
+        exit 1
+    fi
 fi
 
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE="$DATA_ROOT/yifanniu_data/data/DAPO-17k/data/dapo-math-17k.parquet"
-TEST_FILE="[$DATA_ROOT/val_all/aime24.parquet,$DATA_ROOT/val_all/aime25.parquet]"
+TRAIN_FILE=${TRAIN_FILE:-"${DATA_ROOT}/DAPO-17k/data/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"[${DATA_ROOT}/val_all/aime24.parquet,${DATA_ROOT}/val_all/aime25.parquet]"}
 
-# Teacher: JustRL-DeepSeek-1.5B served at <REDACTED_IP>:15555.
+# Teacher: served at TEACHER_SERVER_IP:TEACHER_SERVER_PORT.
 # TEACHER_CKPT_PATH is loaded by OPD reward manager to build teacher tokenizer;
-# since teacher == student tokenizer, `_is_same_tokenizer()` returns True and the
+# when teacher == student tokenizer, `_is_same_tokenizer()` returns True and the
 # retokenize step is a no-op.
-export TEACHER_SERVER_IP="<REDACTED_IP>"
-export TEACHER_SERVER_PORT="15555"
-export TEACHER_N_WORKERS="1"
-export TEACHER_CKPT_PATH="$DATA_ROOT/JustRL-DeepSeek-1.5B"
-export TEACHER_MAX_SEQ_LEN="30720"
+export TEACHER_SERVER_IP
+export TEACHER_SERVER_PORT="${TEACHER_SERVER_PORT:-15555}"
+export TEACHER_N_WORKERS="${TEACHER_N_WORKERS:-1}"
+export TEACHER_CKPT_PATH
+export TEACHER_MAX_SEQ_LEN="${TEACHER_MAX_SEQ_LEN:-30720}"
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG=legacy
 

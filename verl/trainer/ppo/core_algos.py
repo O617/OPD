@@ -1644,7 +1644,7 @@ def compute_policy_loss_opd(
         # # NOTE: no chunk merging — chunks would require metadata from reward worker;
         # # here we dump per-token info so you can identify the seq via input_ids and
         # # cross-reference with the reward-side alignment log.
-        # _debug_file = "$DATA_ROOT/OPD/opd_loss_debug.txt"
+        # _debug_file = "/tmp/opd_loss_debug.txt"
         # try:
         #     tch_seq0 = teacher_log_probs[0]
         #     stu_seq0 = student_log_probs[0]

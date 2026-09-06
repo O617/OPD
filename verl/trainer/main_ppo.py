@@ -522,10 +522,8 @@ if __name__ == "__main__":
         "WANDB_NAME",
     )
     _teacher_env_defaults = {
-        "TEACHER_SERVER_IP": "<REDACTED_IP>",
         "TEACHER_SERVER_PORT": "15555",
         "TEACHER_N_WORKERS": "1",
-        "TEACHER_CKPT_PATH": "$DATA_ROOT/Qwen3-8B",
     }
     for k, v in _teacher_env_defaults.items():
         os.environ.setdefault(k, v)

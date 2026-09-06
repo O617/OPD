@@ -1,8 +1,8 @@
-export PROXY_FRONTEND_PORT=15555
-export PROXY_BACKEND_PORT=15556
+export PROXY_FRONTEND_PORT=${PROXY_FRONTEND_PORT:-15555}
+export PROXY_BACKEND_PORT=${PROXY_BACKEND_PORT:-15556}
 
-BACKEND=vllm
-CKPT_PATH="$DATA_ROOT/models/Qwen3-8B"
+BACKEND=${BACKEND:-vllm}
+: "${CKPT_PATH:?CKPT_PATH must be set (teacher model checkpoint path)}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 wait_server_ready() {

@@ -34,30 +34,30 @@ train_prompt_mini_bsz=64
 # train_prompt_mini_bsz=256
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://<REDACTED_IP>:6379"}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://127.0.0.1:6379"}
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 # NNODES=${NNODES:-1}
 # NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 NNODES=2
 NGPUS_PER_NODE=8
-# Paths
-RAY_DATA_HOME="$DATA_ROOT/develop/OPD"
+
+# Paths (all required — no defaults into cluster-specific mounts)
+: "${RAY_DATA_HOME:?RAY_DATA_HOME must be set (repo root, used for ckpts)}"
+: "${MODEL_PATH:?MODEL_PATH must be set (student init ckpt)}"
+: "${DATA_ROOT:?DATA_ROOT must be set (contains *_messages.parquet + val_all/)}"
+: "${TEACHER_SERVER_IP:?TEACHER_SERVER_IP must be set (remote teacher server)}"
+: "${TEACHER_CKPT_PATH:?TEACHER_CKPT_PATH must be set (teacher tokenizer/ckpt path)}"
+
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-# MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
-MODEL_PATH="$DATA_ROOT/checkpoint-6250"
-# MODEL_PATH="/data/main/hanxiao/Qwen3-1.7B"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-# TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TRAIN_FILE="$DATA_ROOT/deepmath_messages.parquet"
-# TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-# TEST_FILE="$DATA_ROOT/data/output_data.parquet"
-TEST_FILE="[$DATA_ROOT/val_all/aime24.parquet,$DATA_ROOT/val_all/aime25.parquet,$DATA_ROOT/val_all/aime26.parquet,$DATA_ROOT/val_all/math500.parquet]"
-export TEACHER_SERVER_IP="<REDACTED_IP>"
-export TEACHER_SERVER_PORT="15555"
-export TEACHER_N_WORKERS="1"
-export TEACHER_CKPT_PATH="$DATA_ROOT/Qwen3-8B"
-export TEACHER_MAX_SEQ_LEN="30720"
+TRAIN_FILE=${TRAIN_FILE:-"${DATA_ROOT}/deepmath_messages.parquet"}
+TEST_FILE=${TEST_FILE:-"[${DATA_ROOT}/val_all/aime24.parquet,${DATA_ROOT}/val_all/aime25.parquet,${DATA_ROOT}/val_all/aime26.parquet,${DATA_ROOT}/val_all/math500.parquet]"}
+export TEACHER_SERVER_IP
+export TEACHER_SERVER_PORT="${TEACHER_SERVER_PORT:-15555}"
+export TEACHER_N_WORKERS="${TEACHER_N_WORKERS:-1}"
+export TEACHER_CKPT_PATH
+export TEACHER_MAX_SEQ_LEN="${TEACHER_MAX_SEQ_LEN:-30720}"
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG=legacy
 # MATH-500 uses n=1 to save eval time; AIME uses default n=4

@@ -13,6 +13,8 @@
 #   MODEL_PATH          — student init ckpt path
 #   TEACHER_SERVER_IP   — remote teacher server IP
 #   TEACHER_SERVER_PORT — remote teacher server port (default 15555)
+#   TEACHER_CKPT_PATH   — teacher tokenizer/ckpt path (must be visible to student;
+#                          reward manager loads the tokenizer from here)
 #
 # Optional env:
 #   DATASET             = deepmath | dapo         (default deepmath)
@@ -153,6 +155,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TEST_FILE="[${DATA_ROOT}/val_all/aime24.parquet,${DATA_ROOT}/val_all/aime25.parquet]"
 
 : "${TEACHER_SERVER_IP:?TEACHER_SERVER_IP must be set (remote teacher server)}"
+: "${TEACHER_CKPT_PATH:?TEACHER_CKPT_PATH must be set (teacher tokenizer/ckpt path visible to the student — used to load the tokenizer only)}"
 export TEACHER_SERVER_IP
 export TEACHER_SERVER_PORT="${TEACHER_SERVER_PORT:-15555}"
 export TEACHER_N_WORKERS="${TEACHER_N_WORKERS:-8}"

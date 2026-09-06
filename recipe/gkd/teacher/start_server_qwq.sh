@@ -11,12 +11,12 @@
 #      Previously hard-coded in vllm_engine.py; now passed via worker.py.
 # ============================================================================
 
-export PROXY_FRONTEND_PORT=15555
-export PROXY_BACKEND_PORT=15556
+export PROXY_FRONTEND_PORT=${PROXY_FRONTEND_PORT:-15555}
+export PROXY_BACKEND_PORT=${PROXY_BACKEND_PORT:-15556}
 
-BACKEND=vllm
-CKPT_PATH="$DATA_ROOT/QwQ-32B"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+BACKEND=${BACKEND:-vllm}
+: "${CKPT_PATH:?CKPT_PATH must be set (QwQ-32B checkpoint path)}"
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # ------------- vLLM engine knobs (edit here, no need to touch Python) -------

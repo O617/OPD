@@ -168,8 +168,6 @@ class TeacherClient:
     ) -> None:
         self.server_ip = server_ip
         self.server_port = server_port
-        # self.server_ip = "<REDACTED_IP>"
-        # self.server_port = 15555
         self.num_microbatches = num_microbatches
         self.n_server_workers = n_server_workers
         self.max_tokens = max_tokens

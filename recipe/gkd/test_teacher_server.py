@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 
 import torch
@@ -19,7 +20,10 @@ from teacher import TeacherClient
 
 
 def main():
-    teacher_client = TeacherClient("<REDACTED_IP>", 15555)
+    teacher_client = TeacherClient(
+        os.environ.get("TEACHER_SERVER_IP", "127.0.0.1"),
+        int(os.environ.get("TEACHER_SERVER_PORT", "15555")),
+    )
     tokens = [[random.randint(1, 99999) for _ in range(8192)] for _ in range(128)]
     tokens[0][40] = 128858
     _, teacher_topk_logps, teacher_topk_indices = teacher_client.submit(tokens).result()

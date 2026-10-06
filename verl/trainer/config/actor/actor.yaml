@@ -1,0 +1,333 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# Target class for this configuration
+_target_: verl.workers.config.ActorConfig
+
+# Number of rollouts per update (mirrors actor rollout_n)
+rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+
+# the abstract actor configs
+# fsdp, fsdp2 or megatron. must be set.
+strategy: ???
+
+# Split each sample into sub-batches of this size for PPO
+ppo_mini_batch_size: 256
+
+# [Deprecated] Global micro batch size
+ppo_micro_batch_size: null
+
+# Local per-GPU micro batch size
+ppo_micro_batch_size_per_gpu: null
+
+# Whether to automatically adjust batch size at runtime
+# oc.select: the default val for ref.log_prob_use_dynamic_bsz
+use_dynamic_bsz: false
+
+# Max tokens per GPU in one PPO batch; affects gradient accumulation
+# Typically it should be: n * ${data.max_prompt_length} + ${data.max_response_length}
+# oc.select: the default val for ref.log_prob_max_token_len_per_gpu
+ppo_max_token_len_per_gpu: 16384
+
+# PPO clip ratio
+clip_ratio: 0.2
+
+# Lower bound for asymmetric clipping (used in dual-clip PPO)
+clip_ratio_low: 0.2
+
+# Upper bound for asymmetric clipping (used in dual-clip PPO)
+clip_ratio_high: 0.2
+
+# Whether to freeze vision model, if set true, it will be freeze vision model
+freeze_vision_tower: false
+
+# policy loss config
+policy_loss:
+
+  # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.PolicyLossConfig
+
+  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
+  loss_mode: "vanilla"
+
+  # Ratio of tokens to be clipped for clip-cov loss
+  clip_cov_ratio: 0.0002
+
+  # Lower bound for clip-cov loss
+  clip_cov_lb: 1.0
+
+  # Upper bound for clip-cov loss
+  clip_cov_ub: 5.0
+
+  # Ratio of tokens to be applied kl penalty for kl-cov loss
+  kl_cov_ratio: 0.0002
+
+  # KL divergence penalty coefficient
+  ppo_kl_coef: 0.1
+
+  # For OPD loss only. If set, clamps per-token advantage (teacher_logp - student_logp)
+  # to [-v, v] before PPO. Analogous to verl's official `DistillationLossConfig.loss_max_clamp`.
+  # null disables the clamp.
+  opd_loss_max_clamp: null
+
+  # For OPD loss only. Chunk-level credit assignment rule inside each synchronized chunk.
+  # "semantic" (default, paper Eq.7-9): target_i = (L_T / L_S) * log p_i
+  # "uniform"  (P0-1 ablation):        target_i = L_T / n_tokens_in_chunk
+  # Both preserve chunk-level log-prob conservation; on 1:1 chunks both reduce to
+  # target_i = teacher's per-token logp.
+  opd_credit_rule: semantic
+
+  # For OPD loss only. Phase-1/2 magnitude-ablation on the final per-token advantage
+  # A_i = sign(Δ_i) * |Δ_i|. Modes:
+  #   raw                   -- identity (default; standard OPD)
+  #   perm                  -- shuffle |A| within each per-sign group; per-sign Σ|A| preserved
+  #   group_const           -- replace |A| with per-sign-group mean |Δ| (== M=raw, q=uniform)
+  #   sign                  -- |A| := 1 (not scale-matched)
+  #   power                 -- coupled A_i = sign(Δ_i) * |Δ_i|^α  with α = opd_adv_power_alpha
+  #   sign_mass_raw_alloc   -- Phase-2 (2×2 cell): M=c·n_g (scale-matched), q=q_raw
+  #   alloc_power           -- Phase-2 allocation-only sweep, α = opd_adv_alloc_alpha
+  #                            (α=1 ⇔ raw, α=0 ⇔ group_const)
+  #   strength_interp       -- Phase-2 strength-only sweep, β = opd_adv_strength_beta
+  #                            (β=1 ⇔ scale-matched group_const, β=0 ⇔ scale-matched sign)
+  #   dctv                  -- TV-OPD, gradient-norm controller variant;
+  #                            A_i = c_t · sign(Δ_i) with
+  #                            c_t = min(c_cap, D̄_{t-1} / (M̄_{t-1} + ε)) computed
+  #                            from EMAs of the sequence-level TV distance and the
+  #                            predicted one-step TV motion. ("dctv" is the
+  #                            development name for TV-OPD.) See opd_dctv_* below.
+  # Sentinel tokens (Δ=0) contribute zero gradient in any mode.
+  opd_adv_mode: raw
+
+  # For OPD loss only, when opd_adv_mode=power. Exponent α >= 0 applied to |Δ|.
+  # α=0 ⇔ sign, α=1 ⇔ raw; ignored for other modes.
+  opd_adv_power_alpha: 1.0
+
+  # For OPD loss only, when opd_adv_mode=alloc_power. Exponent α >= 0 controlling
+  # within-sign-group allocation concentration:
+  #   q_i^(α) = |Δ_i|^α / Σ_{sign_group} |Δ_j|^α
+  # α=1 recovers raw allocation, α=0 recovers uniform (== group_const). Ignored otherwise.
+  opd_adv_alloc_alpha: 1.0
+
+  # For OPD loss only, when opd_adv_mode=strength_interp. Interpolation weight β on
+  # the pos-mass fraction: r_β = β·r_raw + (1-β)·r_sign, with total strength preserved.
+  # β=1 ⇔ scale-matched group_const, β=0 ⇔ scale-matched sign. Ignored otherwise.
+  opd_adv_strength_beta: 1.0
+
+  # For OPD loss only, when opd_adv_mode=dctv. EMA smoothing on D̂_t (sequence-level
+  # TV distance estimator, mean of [1-exp(Δ)]_+). Positioned as an estimator
+  # smoothing constant, not a method hparam.
+  opd_dctv_beta_d: 0.95
+
+  # For OPD loss only, when opd_adv_mode=dctv. EMA smoothing on M̂_t
+  # (predicted one-step TV motion, 0.5·η·(G_TV)^2). Estimator smoothing constant.
+  opd_dctv_beta_m: 0.95
+
+  # For OPD loss only, when opd_adv_mode=dctv. Numerical floor in
+  #   c_t = min(c_cap, D̄ / (M̄ + ε))
+  # and in the G_TV = G_scaled / max(c, ε) gradient-norm recovery.
+  opd_dctv_eps: 1.0e-8
+
+  # For OPD loss only, when opd_adv_mode=dctv. Upper bound on c_t. 1.0 is the
+  # natural "don't first-order overshoot pure TV" cap. Values >1 are escape-hatch.
+  opd_dctv_c_cap: 1.0
+
+  # TV-guided schedule on the global coefficient c_t (paper Eq. 12; independent
+  # of opd_adv_mode). When enabled,
+  #   c_t = clip(((D̄_{t-1}+ε)/(D_ref+ε))^α, c_min, 1.0),   ε = 1e-5
+  # where D̄_t = β·D̄_{t-1} + (1-β)·D̂_t reuses the OPD D̂ estimator (mean of
+  # [1-exp(Δ)]_+ on eff_mask, DP-reduced). D_ref is captured at the first valid
+  # optimizer step so c_0 = 1. Mutually exclusive with opd_adv_mode=dctv (both
+  # rescale globally). Default off; combine with opd_adv_mode=sign for TV-OPD.
+  opd_tv_sched_enabled: False
+
+  # TV-scheduler EMA smoothing on D̂_t. Estimator constant, not a method hparam.
+  opd_tv_sched_beta: 0.95
+
+  # TV-scheduler annealing exponent α ≥ 0. α=0 ⇔ constant c=1 (equivalent to
+  # pure sign baseline); α=1 ⇔ TV-proportional; larger α anneals more
+  # aggressively. 0.5 is the paper default.
+  opd_tv_sched_alpha: 0.5
+
+  # TV-scheduler floor on c_t (engineering safety cap against LR collapse).
+  opd_tv_sched_c_min: 0.1
+
+  # TV-scheduler target: 'adv' (default, used for the paper results) scales the
+  # policy-loss coefficient by c_t, so c enters BEFORE Adam → g_t, m, v all carry
+  # a factor of c and Adam's √v then largely cancels it. 'lr' multiplies the
+  # optimizer LR instead, so c enters AFTER Adam's m/v normalization and directly
+  # scales Δθ. Two different Adam-interaction semantics. Ignored unless
+  # opd_tv_sched_enabled=True.
+  opd_tv_sched_target: adv
+
+  # For ALM loss only. Divide chunk log-p by this temperature before the Bernoulli BCE.
+  alm_binarization_temp: 1.0
+
+  # For ALM loss only. Elementwise divergence between chunk Bernoullis.
+  # Phase 1 supports only "binary_ce".
+  alm_diff_fn: binary_ce
+
+  # For ALM loss only. Per-chunk aggregation weight.
+  # "chunk_count" (default), "token_count", or "log1p_token_count".
+  alm_numerator: chunk_count
+
+  # For ALM loss only. Denominator mode. Phase 1 supports only "chunk_count".
+  alm_denominator: chunk_count
+
+  # For ALM loss only. Clamp chunk log-p to [-C, 0] before BCE. null disables.
+  alm_chunk_clamp: null
+
+# Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
+clip_ratio_c: 3.0
+
+# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", or "seq-mean-token-sum-norm"
+loss_agg_mode: token-mean
+
+# Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
+# If null, uses response_length. Set to a constant to ensure consistent normalization.
+loss_scale_factor: null
+
+# Entropy regularization coefficient in PPO loss
+entropy_coeff: 0
+
+# When true, the actor forward will request entropy from the model
+calculate_entropy: false
+
+# Whether to use KL loss instead of KL reward penalty. True for GRPO
+use_kl_loss: false
+
+# Whether to use torch.compile()
+# oc.select: the default val for ref.use_torch_compile
+use_torch_compile: true
+
+# KL loss coefficient when use_kl_loss is enabled. For GRPO
+kl_loss_coef: 0.001
+
+# Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
+kl_loss_type: low_var_kl
+
+# Number of PPO epochs per batch
+ppo_epochs: 1
+
+# Shuffle training data across PPO epochs
+shuffle: false
+
+# checkpoint configs
+checkpoint:
+
+  # Target dataclass for this configuration
+  _target_: verl.trainer.config.CheckpointConfig
+
+  # What to include in saved checkpoints
+  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+  save_contents: ['model', 'optimizer', 'extra']
+
+  # For more flexibility, you can specify the contents to load from the checkpoint.
+  # .xxx refers to the local variable xxx from the same level of hierarchy similar to python pkg
+  load_contents: ${.save_contents}
+
+  # Whether to save checkpoints asynchronously. Only effective for Megatron as of now.
+  async_save: False
+
+# optimizer configs
+optim:
+
+  # Learning rate
+  lr: 1e-6
+
+  # Warmup steps ratio (used if lr_warmup_steps is 0 or negative)
+  lr_warmup_steps_ratio: 0.0
+
+  # Total training steps (must be overridden at runtime)
+  total_training_steps: -1
+
+  # Weight decay
+  weight_decay: 0.01
+
+  # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
+  lr_warmup_steps: -1
+
+
+# Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
+use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
+
+# profile the actor model in `update_policy` 
+profiler:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.utils.profiler.ProfilerConfig
+
+  # profiler tool, default same as profiler.tool in global config
+  # choices: nsys, npu, torch
+  tool: ${oc.select:global_profiler.tool,null}
+
+  # whether enable profile on Actor
+  enable: False
+  
+  # Whether to profile all ranks.
+  all_ranks: False
+
+  # The ranks that will be profiled. [] or [0,1,...]
+  ranks: []
+
+  # profile results saving path
+  save_path: ${oc.select:global_profiler.save_path,null}
+
+  # specific tool config which only related to the role
+  tool_config:
+
+    # nsys tool config
+    nsys:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.NsightToolConfig
+    
+      # True for each task has its own database, False for all tasks in one training step share one database.
+      discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete}
+    
+    # npu config
+    npu:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.NPUToolConfig
+
+      # Contents to profile, can be empty
+      # options: npu, cpu, memory, shapes, module, stack
+      contents: []
+
+      # Collection level, optional values: level_none, level0, level1, level2.
+      level: "level1"
+
+      # Whether to automatically parse the data.
+      analysis: True
+
+      # True for each task has its own database, False for all tasks in one training step share one database.
+      discrete: False
+    
+    # torch profiler config
+    torch:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+
+      # start profile mini-batch in training
+      # NOTICE: different with global steps config which refers to iteration
+      # This field only related with mini-batch
+      step_start: 0
+
+      # stop profile mini-batch in training
+      step_end: null
+
+    # torch memory profiler config
+    torch_memory:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.TorchMemoryToolConfig
+
+      # Maximum number of memory allocation entries to track
+      trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
+
+      # Stack trace depth for memory allocations
+      stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
